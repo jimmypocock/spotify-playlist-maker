@@ -1,0 +1,20 @@
+# Credentials & per-user state
+.env
+.spotify_cache
+.claude/settings.local.json
+
+# Generated caches
+.resolution_cache.json
+*.tmp
+
+# Lineup inputs are user-specific; keep only the committed example
+lineups/*
+!lineups/example.txt
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store

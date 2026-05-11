@@ -1,0 +1,22 @@
+# Example artist list — copy this file to lineups/<your_name>.txt and edit.
+# One artist per line. Lines starting with '#' are comments.
+#
+# Optional overrides after a pipe character:
+#   Display Name|<refined search query>
+#   Display Name|<Spotify artist URL, URI, or ID>
+#
+# URL/URI/ID overrides bypass search entirely and look the artist up
+# directly — use these when search keeps picking the wrong artist.
+
+# --- Plain entries (search by display name) ---
+Beyoncé
+Tame Impala
+Phoebe Bridgers
+
+# --- With a refined search query
+#     Useful for stylized or single-common-word names ---
+BUNT.|BUNT
+Geese|Geese band Brooklyn
+
+# --- With a direct Spotify URL (most reliable for ambiguous names) ---
+Palace|https://open.spotify.com/artist/48vDIufGC8ujPuBiTxY8dm
