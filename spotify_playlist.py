@@ -298,8 +298,25 @@ def fetch_top_tracks(
     except spotipy.SpotifyException as e:
         result.error = f"track search failed: {e}"
 
-    if not track_uris and result.entry.artist_id:
-        track_uris, sample = fetch_tracks_via_albums(sp, result.artist_id, n, market)
+    # Fill out the rest via album walk if search underdelivered. Runs for any
+    # resolved artist now (not just ID-overridden ones) — for thin-catalog
+    # cases like 'The War on Drugs' where the 10-result search cap means
+    # most slots got eaten by covers/compilations, the album walk surfaces
+    # deeper cuts from the artist's own albums.
+    if len(track_uris) < n and result.artist_id:
+        seen_uris = set(track_uris)
+        walked_uris, walked_sample = fetch_tracks_via_albums(
+            sp, result.artist_id, n, market, skip_uris=seen_uris,
+        )
+        for uri in walked_uris:
+            if uri in seen_uris:
+                continue
+            track_uris.append(uri)
+            seen_uris.add(uri)
+            if len(track_uris) >= n:
+                break
+        if sample is None:
+            sample = walked_sample
 
     if track_uris:
         result.track_uris = track_uris
@@ -310,11 +327,19 @@ def fetch_top_tracks(
 
 
 def fetch_tracks_via_albums(
-    sp: spotipy.Spotify, artist_id: str, n: int, market: str
+    sp: spotipy.Spotify,
+    artist_id: str,
+    n: int,
+    market: str,
+    skip_uris: Optional[set[str]] = None,
 ) -> tuple[list[str], Optional[str]]:
-    """Walk the artist's albums to collect their own tracks. Used as a
-    fallback when search-by-name can't surface the artist's catalog (common
-    for obscure acts whose name collides with popular tracks/albums)."""
+    """Walk the artist's albums to collect their own tracks. Used to fill out
+    thin search results or as a full fallback when search-by-name finds nothing.
+
+    `skip_uris` lets the caller exclude tracks already collected via another
+    path (typically search), so the walk only adds NEW tracks beyond those.
+    """
+    skip_uris = skip_uris or set()
     track_uris: list[str] = []
     first_name: Optional[str] = None
     seen_names: set[str] = set()
@@ -327,29 +352,34 @@ def fetch_tracks_via_albums(
             # entries are EPs Spotify classifies oddly. Pass country=market
             # explicitly — spotipy sends `country=None` literally otherwise,
             # and Spotify rejects it as a malformed param.
+            # Feb 2026: artist_albums max limit reduced from 50 to 10.
             page = sp.artist_albums(
                 artist_id,
                 album_type="album,single,compilation",
                 country=market,
-                limit=50,
+                limit=10,
                 offset=offset,
             )
             time.sleep(RATE_LIMIT_SLEEP)
             albums.extend(page.get("items", []))
             if not page.get("next"):
                 break
-            offset += 50
-    except spotipy.SpotifyException:
+            offset += 10
+    except spotipy.SpotifyException as e:
+        log.warning("artist_albums failed for %s: %s", artist_id, e)
         return track_uris, first_name
 
     for album in albums:
         try:
             tracks_resp = sp.album_tracks(album["id"], market=market, limit=50)
             time.sleep(RATE_LIMIT_SLEEP)
-        except spotipy.SpotifyException:
+        except spotipy.SpotifyException as e:
+            log.warning("album_tracks failed for album %s: %s", album.get("id"), e)
             continue
         for t in tracks_resp.get("items", []):
             if not any(a.get("id") == artist_id for a in t.get("artists", [])):
+                continue
+            if t["uri"] in skip_uris:
                 continue
             key = t["name"].lower().strip()
             if key in seen_names:
@@ -575,7 +605,19 @@ def main() -> int:
         time.sleep(RATE_LIMIT_SLEEP)
         log.info("Cleared existing tracks (replace mode)")
 
-    all_uris = [uri for r in found for uri in r.track_uris]
+    # Dedupe across artists by URI — when track X features both Artist A and
+    # Artist B and both are in the lineup, our per-artist resolution returns X
+    # twice. Spotify allows playlist duplicates, but the user doesn't want them.
+    # Preserves artist order (first occurrence wins). Different versions of a
+    # song have different URIs and are kept.
+    all_uris: list[str] = []
+    seen: set[str] = set()
+    for r in found:
+        for uri in r.track_uris:
+            if uri in seen:
+                continue
+            seen.add(uri)
+            all_uris.append(uri)
     add_tracks_in_batches(sp, playlist_id, all_uris)
 
     pl = sp.playlist(playlist_id, fields="external_urls,name")
