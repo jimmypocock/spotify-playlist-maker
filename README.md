@@ -23,15 +23,25 @@ The `/playlist` skill is project-scoped (lives in `.claude/skills/`), so it's av
 
 The app stays in Development Mode forever — that's fine. As the app owner with a Premium account, you don't hit user-allowlist limits for your own use.
 
-### 2. Install dependencies
+### 2. Get a Last.fm API key (recommended, ~1 min)
+
+Spotify's Dev Mode daily quota is brutally tight — about 150-200 calls per 24h, enough to lock you out for ~24h after a couple of full playlist builds. The script offloads artist/track discovery to Last.fm + ListenBrainz (both free, no quota worth worrying about) when a Last.fm key is configured.
+
+1. Go to https://www.last.fm/api/account/create (you'll need to be logged into a regular Last.fm account first — sign up at https://www.last.fm/join if you don't have one).
+2. Fill in any application name and description. Leave callback URL blank.
+3. Copy the **API key** (and the shared secret — we don't use it yet but you can't see it again later).
+
+You can skip this step — the script will work without it — but a 100-artist build will then take 3-4 days to complete due to Spotify's quota.
+
+### 3. Install dependencies
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install spotipy python-dotenv
+pip install spotipy python-dotenv requests
 ```
 
-### 3. Create `.env`
+### 4. Create `.env`
 
 Copy `.env.example` to `.env` and fill in:
 
@@ -39,6 +49,9 @@ Copy `.env.example` to `.env` and fill in:
 SPOTIPY_CLIENT_ID=your_client_id_here
 SPOTIPY_CLIENT_SECRET=your_client_secret_here
 SPOTIPY_REDIRECT_URI=http://127.0.0.1:8888/callback
+
+# Optional but strongly recommended (see step 2):
+LASTFM_API_KEY=your_lastfm_api_key_here
 ```
 
 ## Usage
@@ -60,15 +73,17 @@ First run pops a browser to authorize the app against your Spotify account. Afte
 
 ### Flags
 
-| Flag            | Default | Notes                                          |
-|-----------------|---------|------------------------------------------------|
-| `--artists`     | —       | Path to your lineup file (required)            |
-| `--name`        | —       | Playlist name (required)                       |
-| `--top`         | 10      | Top N tracks per artist                        |
-| `--market`      | US      | ISO country code; affects track availability   |
-| `--description` | ""      | Playlist description                           |
-| `--public`      | off     | Make playlist public (default: private)        |
-| `--dry-run`     | off     | Resolve & report only, don't write             |
+| Flag            | Default | Notes                                                                       |
+|-----------------|---------|-----------------------------------------------------------------------------|
+| `--artists`     | —       | Path to your lineup file (required)                                         |
+| `--name`        | —       | Playlist name (required)                                                    |
+| `--top`         | 10      | Top N tracks per artist                                                     |
+| `--market`      | US      | ISO country code; affects track availability                                |
+| `--description` | ""      | Playlist description                                                        |
+| `--public`      | off     | Make playlist public (default: private)                                     |
+| `--replace`     | off     | Wipe an existing same-named playlist before adding (default: append)        |
+| `--fast`        | off     | Skip album-walk fill-in for search-resolved artists (saves Spotify quota)   |
+| `--dry-run`     | off     | Resolve & report only, don't write                                          |
 
 ## Artists file format
 
@@ -106,19 +121,35 @@ Review needed (3):
       fix: in lineups/<your_name>.txt, change line to 'Geese|<more specific search query>'
 ```
 
-Confidence scoring is intentionally minimal: Spotify stripped artist `popularity`, `followers`, and `genres` from Dev Mode responses in Feb 2026, so only **name distance** and **same-name ambiguity** can be detected automatically. The top-track display is the main eyeball-verification signal — if the top track comes back as something you recognize, it's the right artist. Edit the lineup file with `Display|<refined query>` or `Display|<Spotify URL>` overrides for the flagged ones, re-run, then do the real run. Re-running with the same `--name` reuses the existing playlist; to fully refresh, uncomment the `playlist_replace_items` line in the script.
+Confidence scoring is intentionally minimal: Spotify stripped artist `popularity`, `followers`, and `genres` from Dev Mode responses in Feb 2026, so only **name distance** and **same-name ambiguity** can be detected automatically. The top-track display is the main eyeball-verification signal — if the top track comes back as something you recognize, it's the right artist. Edit the lineup file with `Display|<refined query>` or `Display|<Spotify URL>` overrides for the flagged ones, re-run, then do the real run.
 
-## Notes on Spotify API quirks
+Re-running with the same `--name` reuses the existing playlist and **appends** new tracks by default. To fully refresh (wipe then re-add), pass `--replace`.
 
-- **`/artists/{id}/top-tracks` was removed** for new Dev Mode apps in Feb 2026. The script works around this with `search(type=track)` filtered by artist ID.
-- **Artist metadata stripped**: `popularity`, `followers`, and `genres` no longer come back on artist objects in Dev Mode — every artist looks identical (all zero/empty). This is why confidence scoring is reduced to name + same-name ambiguity only.
-- **Search limit** is 10 results per page (Feb 2026 Dev Mode change). The artist resolver pulls a full page so it can keep alternatives for the review block.
-- **Rate limits**: two-layer. A per-30s burst limit (~180 req — handled by a 0.2s sleep between calls) AND a much tighter **daily quota** that can lock you out for ~20 hours after only a couple of full runs. The resolution cache (below) is the real defense.
-- **Other removed endpoints** (audio-features, recommendations, related-artists, batch `/artists`, etc.) aren't in our path.
+## How discovery works (Last.fm + ListenBrainz)
+
+When `LASTFM_API_KEY` is in your `.env`, the script does artist/track discovery off-Spotify:
+
+1. **Last.fm `artist.getTopTracks`** — one call per artist, returns the top tracks ordered by global popularity. Has an autocorrect feature that handles most name disambiguation automatically.
+2. **ListenBrainz `spotify-id-from-metadata`** — one batch call per artist, maps every track from step 1 to a Spotify track URI in a single request.
+
+That's **2 HTTP calls per artist**, both to free services with no meaningful quota, instead of 5-8 Spotify calls per artist. The Spotify API only gets touched for the final playlist write (~15 calls regardless of size).
+
+If a Last.fm key isn't configured, the script falls back to Spotify-only discovery: `search(type=track)` for tracks credited to the artist, then walking the artist's albums via `artist_albums` + `album_tracks` to fill out anything search missed. Works, but slow and quota-bound.
+
+## Notes on Spotify API quirks (Feb 2026 lockdown)
+
+A bunch of useful endpoints were removed or reshaped in Feb 2026; the relevant ones are worked around in code:
+
+- **`/artists/{id}/top-tracks` is gone** for new Dev Mode apps. Replaced by `search(type=track)` filtered by artist ID, then album walking.
+- **`POST /users/{id}/playlists` returns 403** for Dev Mode apps. Use `POST /me/playlists` instead. spotipy still calls the old path; we bypass via `sp._post`.
+- **Playlist response schema changed**: `tracks` renamed to `items`, and inside each item `track` renamed to `item`. spotipy's `playlist_items()` returns the old shape but with empty values.
+- **Artist metadata stripped**: `popularity`, `followers`, and `genres` no longer come back on artist objects.
+- **Search limit** is 10 results per page; **`artist_albums` limit** is 10 (was 50).
+- **Rate limits**: per-30s burst (~180 req) AND a much tighter **daily quota** — about 150-200 calls per 24h rolling window. Once exceeded, you're locked out for ~24h. The Last.fm path above is the real fix.
 
 ## Resolution cache (`.resolution_cache.json`)
 
-After each successful artist resolution, the script appends to `.resolution_cache.json`. Re-runs hit the cache and skip the API for those entries — zero calls if nothing changed. Cache key includes the entry's override, so changing an artist's line in the file invalidates just that entry. To re-resolve everything, delete the file.
+After each successful artist resolution, the script appends to `.resolution_cache.json`. Re-runs hit the cache and skip discovery for those entries — zero API calls if nothing changed. Cache key includes the entry's override, so changing an artist's line in the file invalidates just that entry. To re-resolve everything, delete the file.
 
 The cache is gitignored — it's user-specific and may contain proprietary lineup data.
 

@@ -19,8 +19,9 @@ Before doing anything else, verify the working directory has what's needed:
 
 1. `test -f .env && test -f spotify_playlist.py && test -d lineups`
 2. Pick the Python interpreter: prefer `.venv/bin/python` if it exists, fall back to `python3`. Store the choice — use it for every CLI invocation below.
+3. Check for `LASTFM_API_KEY` in `.env` (just grep). If absent, mention to the user: "You don't have a Last.fm API key configured — without it, the script will use Spotify's API for discovery, which has a tight daily quota (~150 calls/day) and may not complete a large lineup in one session. Get a free key at https://www.last.fm/api/account/create (takes ~1 min) for much faster builds. Want to set that up first, or proceed with Spotify-only?"
 
-If `.env` is missing, point the user at README §1 (register Spotify app + create `.env`). If `.venv` is missing, suggest: `python3 -m venv .venv && .venv/bin/pip install spotipy python-dotenv`. Don't proceed until these are in place.
+If `.env` is missing entirely, point the user at README §1 (register Spotify app + create `.env`). If `.venv` is missing, suggest: `python3 -m venv .venv && .venv/bin/pip install spotipy python-dotenv requests`. Don't proceed until these are in place.
 
 ## Step 1 — Identify the input source
 
@@ -125,6 +126,6 @@ When it finishes, report the playlist URL from the script's final line.
 
 - **Be terse during execution.** Don't echo the entire dry-run log; summarize and surface only flagged artists.
 - **Be honest about misses.** If the script can't find tracks for an artist (legitimate Spotify gap), tell the user; don't pretend it succeeded.
-- **Rate limit handling.** If a run hits Spotify's daily quota (Retry-After ~72000s), stop immediately, explain that the user is locked out for ~20h, and exit. Don't sleep through it.
-- **Cache awareness.** Mention how many cache hits vs new resolutions there were (`X/Y from cache`) — gives the user a sense of cost.
+- **Rate limit handling.** If a run hits Spotify's daily quota (Retry-After ~72000s), stop immediately (don't let spotipy sleep through it — kill the python process), explain the user is locked out for ~24h, and suggest setting `LASTFM_API_KEY` if they haven't already. With Last.fm configured, discovery doesn't touch Spotify's quota and a fresh build of 100+ artists takes under 2 minutes.
+- **Cache awareness.** Mention how many cache hits vs new resolutions there were (`X/Y from cache`) — gives the user a sense of cost. With Last.fm, even fresh resolutions are nearly free.
 - **No autonomous invocation.** This skill has `disable-model-invocation: true` — the user must explicitly type `/playlist`. Don't try to invoke it on their behalf in other contexts.
