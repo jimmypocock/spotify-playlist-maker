@@ -63,6 +63,19 @@ Don't re-introduce code that fights these:
 
 Cache hits skip both `resolve_artist` and `fetch_top_tracks` entirely (zero API calls). Re-runs after a clean first run typically make 0 API calls in the resolve phase. To force a full re-resolve, delete the file. Don't commit it (per-user, may contain proprietary lineup data).
 
+### Discovery via Last.fm + ListenBrainz (the primary path when configured)
+
+When `LASTFM_API_KEY` is in `.env`, `fetch_top_tracks()` tries this path first and only falls back to Spotify if it comes up short:
+
+1. `_lastfm_get_top_tracks()` — single `artist.getTopTracks` call with `autocorrect=1`, returns ordered track names. Ignore the MBIDs Last.fm returns; they're frequently stale/invalid against the live MusicBrainz database (404 on lookup).
+2. `_listenbrainz_map_tracks()` — single batch POST to `https://labs.api.listenbrainz.org/spotify-id-from-metadata/json` with all track names + the artist name. Returns Spotify track IDs (`{track_name: spotify_uri}`).
+
+Two HTTP calls per artist total — both to free, no-key, no-quota services. The Last.fm key is free, instant signup, no approval. This bypasses Spotify's daily quota entirely for the discovery phase; only the final playlist write (~15 calls for a 1000-track playlist) touches the Spotify API.
+
+Critical: when the Last.fm path succeeds, `result.matched_name` is forced to `entry.display_name` to keep the cache consistent with what Last.fm actually searched for. Otherwise Spotify's `resolve_artist` might have picked a different same-named artist, and the cached `matched_name` would mislead the review block.
+
+If `LASTFM_API_KEY` is absent, the script falls back to pure-Spotify resolution — slower but still works. The Last.fm path requires no other configuration.
+
 ### Other Feb 2026 endpoint surprises actually hit
 
 Found empirically while writing the playlist phase:

@@ -45,6 +45,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+import requests
 import spotipy
 from dotenv import load_dotenv
 from spotipy.oauth2 import SpotifyOAuth
@@ -56,7 +57,13 @@ CACHE_PATH = ".spotify_cache"                 # spotipy OAuth token cache
 RESOLUTION_CACHE_PATH = ".resolution_cache.json"  # our per-artist resolution cache
 SPOTIFY_ADD_BATCH = 100  # max tracks per add-to-playlist call
 SEARCH_LIMIT = 10        # Spotify search max page size as of Feb 2026
-RATE_LIMIT_SLEEP = 0.2   # seconds between API calls — keeps us well under 6/s burst cap
+RATE_LIMIT_SLEEP = 0.2   # seconds between Spotify API calls — keeps us well under 6/s burst cap
+
+# Off-Spotify discovery sources. Used to side-step Spotify's tight daily quota.
+LASTFM_API = "https://ws.audioscrobbler.com/2.0/"
+LISTENBRAINZ_LABS = "https://labs.api.listenbrainz.org"
+LASTFM_SLEEP = 0.2   # polite delay between Last.fm calls
+USER_AGENT = "spotify-playlist-maker/0.2 (+https://github.com/jimmypocock/spotify-playlist-maker)"
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -221,8 +228,10 @@ def get_client() -> spotipy.Spotify:
 
 def resolve_artist(sp: spotipy.Spotify, entry: ArtistEntry) -> ResolveResult:
     """Resolve an entry to a Spotify artist. If the entry has a direct ID
-    override, look it up via /artists/{id} and skip search entirely. Otherwise
-    search by name, take the top hit, and keep next 4 as alternatives.
+    override, trust it and skip the artist lookup entirely (the user already
+    verified the URL — we'd only be paying an API call to fetch the canonical
+    name for display purposes). Otherwise search by name, take the top hit,
+    and keep next 4 as alternatives.
 
     Note: as of Feb 2026, Dev Mode apps no longer receive `popularity`,
     `followers`, or `genres` on artist objects — so we only have name and ID
@@ -230,13 +239,9 @@ def resolve_artist(sp: spotipy.Spotify, entry: ArtistEntry) -> ResolveResult:
     """
     result = ResolveResult(entry=entry)
     if entry.artist_id:
-        try:
-            artist = sp.artist(entry.artist_id)
-            time.sleep(RATE_LIMIT_SLEEP)
-            result.artist_id = artist["id"]
-            result.matched_name = artist["name"]
-        except spotipy.SpotifyException as e:
-            result.error = f"artist lookup failed: {e}"
+        # Skip sp.artist() — trust user-provided ID, use display name as matched.
+        result.artist_id = entry.artist_id
+        result.matched_name = entry.display_name
         return result
     try:
         resp = sp.search(q=entry.search_query, type="artist", limit=SEARCH_LIMIT)
@@ -257,53 +262,196 @@ def resolve_artist(sp: spotipy.Spotify, entry: ArtistEntry) -> ResolveResult:
     return result
 
 
+# ---------- off-Spotify discovery (Last.fm + ListenBrainz) ----------
+#
+# Spotify Dev Mode's daily quota is brutally tight (~150-200 calls per 24h),
+# so artist/track discovery is done via free external sources when possible:
+#   Last.fm artist.getTopTracks         → top track names for an artist (1 call)
+#   ListenBrainz spotify-id-from-metadata → batch map (artist, track) → Spotify
+#                                           track IDs in a single call
+# Only the final playlist write touches Spotify's API in this path.
+#
+# Note: Last.fm DOES return MBIDs but they're frequently stale/invalid against
+# the live MusicBrainz database, so we ignore them and use track names instead.
+
+def _lastfm_get_top_tracks(
+    artist_name: str, n: int, api_key: str
+) -> list[str]:
+    """Call Last.fm artist.getTopTracks. Returns ordered list of track names.
+    Returns [] on any failure — caller falls back to Spotify path."""
+    params = {
+        "method": "artist.getTopTracks",
+        "artist": artist_name,
+        "api_key": api_key,
+        "format": "json",
+        "autocorrect": 1,
+        "limit": n,
+    }
+    try:
+        r = requests.get(
+            LASTFM_API,
+            params=params,
+            headers={"User-Agent": USER_AGENT},
+            timeout=10,
+        )
+        time.sleep(LASTFM_SLEEP)
+        r.raise_for_status()
+        data = r.json()
+        if "error" in data:
+            log.warning("Last.fm error for %r: %s", artist_name, data.get("message"))
+            return []
+        raw_tracks = data.get("toptracks", {}).get("track", [])
+        return [t["name"] for t in raw_tracks if t.get("name")]
+    except (requests.RequestException, ValueError) as e:
+        log.warning("Last.fm request failed for %r: %s", artist_name, e)
+        return []
+
+
+def _listenbrainz_map_tracks(
+    artist_name: str, track_names: list[str]
+) -> dict[str, Optional[str]]:
+    """Batch-map (artist_name, track_name) pairs to Spotify track URIs via
+    ListenBrainz labs `spotify-id-from-metadata`. One POST request handles
+    every track for an artist. Returns {track_name: spotify_uri_or_None}."""
+    if not track_names:
+        return {}
+    url = f"{LISTENBRAINZ_LABS}/spotify-id-from-metadata/json"
+    payload = [
+        {"artist_name": artist_name, "release_name": "", "track_name": t}
+        for t in track_names
+    ]
+    try:
+        r = requests.post(
+            url,
+            json=payload,
+            headers={"User-Agent": USER_AGENT},
+            timeout=15,
+        )
+        time.sleep(LASTFM_SLEEP)
+        r.raise_for_status()
+        data = r.json()
+    except (requests.RequestException, ValueError) as e:
+        log.warning("ListenBrainz mapping failed for %r: %s", artist_name, e)
+        return {t: None for t in track_names}
+
+    out: dict[str, Optional[str]] = {t: None for t in track_names}
+    for entry in data:
+        name = entry.get("track_name")
+        ids = entry.get("spotify_track_ids") or []
+        if name in out and ids:
+            out[name] = f"spotify:track:{ids[0]}"
+    return out
+
+
+def fetch_top_tracks_via_lastfm(
+    artist_name: str, n: int, api_key: str
+) -> tuple[list[str], Optional[str]]:
+    """End-to-end: artist display name → up to n Spotify track URIs.
+    Over-requests from Last.fm (2x n) so unmapped tracks don't shrink the
+    result. Two HTTP calls total per artist: Last.fm + ListenBrainz batch.
+    Returns (track_uris, first_track_name)."""
+    track_names = _lastfm_get_top_tracks(artist_name, n=n * 2, api_key=api_key)
+    if not track_names:
+        return [], None
+    mapping = _listenbrainz_map_tracks(artist_name, track_names)
+    uris: list[str] = []
+    first_name: Optional[str] = None
+    seen: set[str] = set()
+    for name in track_names:  # preserve Last.fm's popularity order
+        uri = mapping.get(name)
+        if not uri or uri in seen:
+            continue
+        uris.append(uri)
+        seen.add(uri)
+        if first_name is None:
+            first_name = name
+        if len(uris) >= n:
+            break
+    return uris, first_name
+
+
 def fetch_top_tracks(
-    sp: spotipy.Spotify, result: ResolveResult, n: int, market: str
+    sp: spotipy.Spotify,
+    result: ResolveResult,
+    n: int,
+    market: str,
+    fast: bool = False,
 ) -> None:
     """Populate result.track_uris with up to n popular tracks for the artist.
 
-    Spotify removed GET /artists/{id}/top-tracks for new Dev Mode apps in the
-    Feb 2026 API changes. Primary path: search type=track with the artist's
-    query, filter to tracks that actually credit this artist (drops covers and
-    stray features by other artists), sort by track popularity.
+    Resolution order:
+    1. Last.fm artist.getTopTracks + ListenBrainz MBID→Spotify mapping (if
+       LASTFM_API_KEY env var is set). Free, no Spotify quota cost.
+    2. Spotify search type=track filtered by artist_id, sorted by popularity.
+    3. Album walk via /artists/{id}/albums + /albums/{id}/tracks for whatever
+       slots remain. Expensive (~5 Spotify calls per artist), so --fast limits
+       this to ID-overridden entries.
 
-    Fallback (only when the entry came in with an ID override): walk the
-    artist's albums via /artists/{id}/albums + /albums/{id}/tracks. Search-by-
-    name doesn't reliably surface tracks for obscure artists with generic names
-    ('Common People', 'Almost Heaven', ...) — but the album walk does.
+    Each step only runs if the previous one didn't return n tracks.
+    The Last.fm path doesn't require a Spotify artist_id — useful when
+    Spotify is rate-limited and resolve_artist couldn't get one.
     """
-    if not result.artist_id:
+    lastfm_key = os.getenv("LASTFM_API_KEY")
+    if not result.artist_id and not lastfm_key:
         return
 
     track_uris: list[str] = []
     sample: Optional[str] = None
-    try:
-        resp = sp.search(
-            q=result.entry.search_query,
-            type="track",
-            limit=SEARCH_LIMIT,
-            market=market,
-        )
-        time.sleep(RATE_LIMIT_SLEEP)
-        items = resp.get("tracks", {}).get("items", [])
-        own = [
-            t for t in items
-            if any(a.get("id") == result.artist_id for a in t.get("artists", []))
-        ]
-        own.sort(key=lambda t: t.get("popularity", 0), reverse=True)
-        tracks = own[:n]
-        track_uris = [t["uri"] for t in tracks]
-        if tracks:
-            sample = tracks[0].get("name")
-    except spotipy.SpotifyException as e:
-        result.error = f"track search failed: {e}"
 
-    # Fill out the rest via album walk if search underdelivered. Runs for any
-    # resolved artist now (not just ID-overridden ones) — for thin-catalog
-    # cases like 'The War on Drugs' where the 10-result search cap means
-    # most slots got eaten by covers/compilations, the album walk surfaces
-    # deeper cuts from the artist's own albums.
-    if len(track_uris) < n and result.artist_id:
+    # Path 1: Last.fm + ListenBrainz (no Spotify cost, no artist_id needed)
+    if lastfm_key:
+        lastfm_uris, lastfm_sample = fetch_top_tracks_via_lastfm(
+            result.entry.display_name, n, api_key=lastfm_key,
+        )
+        if lastfm_uris:
+            track_uris = lastfm_uris
+            sample = lastfm_sample
+            # Last.fm searched by display_name. If Spotify's resolve_artist
+            # had picked a different same-name artist, the matched_name would
+            # be misleading. Override to match what Last.fm actually used.
+            result.matched_name = result.entry.display_name
+
+    # Path 2: Spotify search-by-track (requires artist_id)
+    if result.artist_id and len(track_uris) < n:
+        try:
+            resp = sp.search(
+                q=result.entry.search_query,
+                type="track",
+                limit=SEARCH_LIMIT,
+                market=market,
+            )
+            time.sleep(RATE_LIMIT_SLEEP)
+            items = resp.get("tracks", {}).get("items", [])
+            own = [
+                t for t in items
+                if any(a.get("id") == result.artist_id for a in t.get("artists", []))
+            ]
+            own.sort(key=lambda t: t.get("popularity", 0), reverse=True)
+            seen = set(track_uris)
+            for t in own:
+                if t["uri"] in seen:
+                    continue
+                track_uris.append(t["uri"])
+                seen.add(t["uri"])
+                if sample is None:
+                    sample = t.get("name")
+                if len(track_uris) >= n:
+                    break
+        except spotipy.SpotifyException as e:
+            result.error = f"track search failed: {e}"
+
+    # Fill out the rest via album walk if search underdelivered. The walk is
+    # expensive (~5 API calls per artist), so under --fast we limit it to
+    # ID-overridden entries — where the user explicitly told us the right
+    # artist, typically tiny acts whose search returns ~nothing without a
+    # name boost. Search-resolved artists in --fast just take what search
+    # gave them; that's usually 7-10 tracks anyway for any halfway-popular act.
+    should_walk = (
+        len(track_uris) < n
+        and result.artist_id
+        and (result.entry.artist_id or not fast)
+    )
+    if should_walk:
         seen_uris = set(track_uris)
         walked_uris, walked_sample = fetch_tracks_via_albums(
             sp, result.artist_id, n, market, skip_uris=seen_uris,
@@ -519,6 +667,7 @@ def main() -> int:
     parser.add_argument("--description", default="", help="playlist description")
     parser.add_argument("--public", action="store_true", help="make playlist public (default private)")
     parser.add_argument("--replace", action="store_true", help="clear an existing same-named playlist before adding (default: append)")
+    parser.add_argument("--fast", action="store_true", help="skip album-walk fill-in for search-resolved artists (still walks ID-overridden ones) — saves ~5 API calls/artist, accepts thin search results")
     parser.add_argument("--dry-run", action="store_true", help="resolve artists & print plan, don't write")
     args = parser.parse_args()
 
@@ -554,9 +703,11 @@ def main() -> int:
 
         log.info("[%d/%d] %s", i, len(entries), entry.display_name)
         r = resolve_artist(sp, entry)
-        if r.artist_id:
-            fetch_top_tracks(sp, r, args.top, args.market)
-            score_confidence(r)
+        # Always try track-fetch. The Last.fm path works even when resolve_artist
+        # failed (e.g., Spotify rate-limited) since it doesn't need a Spotify ID.
+        fetch_top_tracks(sp, r, args.top, args.market, fast=args.fast)
+        score_confidence(r)
+        if r.track_uris:
             sample = f" (top: {r.sample_track!r})" if r.sample_track else ""
             tag = ""
             if r.confidence == "low":
@@ -564,12 +715,11 @@ def main() -> int:
             elif r.confidence == "medium":
                 tag = " ⚠ medium confidence"
             log.info("  → %d tracks%s%s", len(r.track_uris), sample, tag)
-            if r.track_uris:
-                # Persist immediately so a mid-run crash doesn't lose progress.
-                cache[key] = cache_record(r)
-                save_resolution_cache(cache_path, cache)
+            # Persist immediately so a mid-run crash doesn't lose progress.
+            cache[key] = cache_record(r)
+            save_resolution_cache(cache_path, cache)
         else:
-            log.warning("  → %s", r.error)
+            log.warning("  → %s", r.error or "no tracks found")
         results.append(r)
 
     if cache_hits:
