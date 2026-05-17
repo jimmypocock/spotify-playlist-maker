@@ -98,14 +98,26 @@ Three searches max for one request, unless the user explicitly asks for thorough
 5. Confirm → real run
 ```
 
-### Pattern B — Concert / single artist live
+### Pattern B — Concert / live show
+
+A "concert" is rarely just one artist — there are usually openers / supporting acts on the bill. **Always consider this** when the user mentions a specific concert:
 
 ```
-1. (Optional) WebSearch for tour name if user said "current tour" etc.
-2. <python> spotify_playlist.py --setlist "<artist>" [--tour ...] [--year ...] [--shows N] --dry-run
-3. Surface track count + cover-artist sample
-4. Confirm → real run (name auto-derives if omitted)
+1. Identify the headliner + ALL openers on this date.
+   - Ask the user: "Who's opening?" — fastest if they know
+   - Or WebSearch: "<headliner> tour 2026 openers", or check the venue's
+     event page if they mentioned it
+   - Or check Setlist.fm for other setlists at the same venue+date
+2. (Optional) WebSearch for tour name if user said "current tour" etc.
+3. Pass every artist via repeated --setlist:
+   <python> spotify_playlist.py \
+       --setlist "Headliner" --setlist "Opener 1" --setlist "Opener 2" \
+       [--tour ...] [--year ...] [--shows N] --dry-run
+4. Surface per-artist track count + total + any covers worth flagging
+5. Confirm → real run (multi-artist auto-names as "<Headliner> & N more — Live")
 ```
+
+For single-artist live (no openers), same pattern with just one `--setlist`.
 
 ### Pattern C — Image attachment
 

@@ -88,9 +88,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--artists", type=Path,
                       help="path to a lineup file (top-tracks mode)")
-    mode.add_argument("--setlist", metavar="ARTIST",
+    mode.add_argument("--setlist", action="append", metavar="ARTIST",
                       help="artist name to build a playlist of their recent live setlists "
-                           "(concert mode — requires SETLISTFM_API_KEY in .env)")
+                           "(concert mode — requires SETLISTFM_API_KEY in .env). "
+                           "Pass multiple times for multi-artist concerts: "
+                           "--setlist 'Headliner' --setlist 'Opener'")
 
     parser.add_argument("--name", help="playlist name (auto-derived in setlist mode if omitted)")
     parser.add_argument("--top", type=int, default=10, help="top N tracks per artist (default 10, top-tracks mode only)")
@@ -199,21 +201,28 @@ def main() -> int:
             filter_desc += f" tour={args.tour!r}"
         if args.year:
             filter_desc += f" year={args.year}"
-        log.info("Concert mode: fetching last %d setlists for %r%s",
-                 args.shows, args.setlist, filter_desc)
-        results = [fetch_setlist_tracks(
-            args.setlist, args.shows, setlist_key,
-            tour=args.tour, year=args.year,
-        )]
-        # Auto-derive name if omitted — include filter hints when present
+        log.info("Concert mode: fetching last %d setlists each for %d artist(s)%s",
+                 args.shows, len(args.setlist), filter_desc)
+        results = []
+        for artist in args.setlist:
+            log.info("  → %s", artist)
+            results.append(fetch_setlist_tracks(
+                artist, args.shows, setlist_key,
+                tour=args.tour, year=args.year,
+            ))
+        # Auto-derive name if omitted — include filter hints / multi-artist tag
         if not args.name:
-            canonical = results[0].matched_name or args.setlist
-            if args.tour:
-                args.name = f"{canonical} — {args.tour}"
-            elif args.year:
-                args.name = f"{canonical} — Live {args.year}"
+            if len(results) == 1:
+                canonical = results[0].matched_name or args.setlist[0]
+                if args.tour:
+                    args.name = f"{canonical} — {args.tour}"
+                elif args.year:
+                    args.name = f"{canonical} — Live {args.year}"
+                else:
+                    args.name = f"{canonical} — Recent Live"
             else:
-                args.name = f"{canonical} — Recent Live"
+                first = results[0].matched_name or args.setlist[0]
+                args.name = f"{first} & {len(results) - 1} more — Live"
             log.info("Playlist name: %r (auto-derived)", args.name)
         _print_summary(results, Path(f"<setlist:{args.setlist}>"))
     else:
