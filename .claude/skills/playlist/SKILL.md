@@ -1,96 +1,154 @@
 ---
-description: Build a Spotify playlist either of top tracks per artist (from a file/image/paste) OR of an artist's recent live setlists (concert mode). Uses vision to extract artists from posters, walks the user through review, and creates the playlist in their Spotify account.
+description: Build a Spotify playlist from any description of what you want — a festival lineup image, a pasted artist list, a concert you're going to, a tour name, a single artist, a vibe. Interprets messy natural language, researches missing info from the web when needed, and creates the playlist in the user's Spotify account.
 disable-model-invocation: true
-allowed-tools: Bash(.venv/bin/python *), Bash(python3 *), Bash(test *), Bash(ls *), Bash(mkdir *), Read, Write, Edit, Glob
-argument-hint: "[lineup-path] [--name \"<playlist>\"]  |  [concert request like \"seeing Phoebe Bridgers Friday\"]  |  use with an attached image or pasted artist list"
+allowed-tools: Bash(.venv/bin/python *), Bash(python3 *), Bash(test *), Bash(ls *), Bash(mkdir *), Bash(grep *), Read, Write, Edit, Glob, WebFetch, WebSearch
+argument-hint: "describe what you want — \"seeing Phoebe Bridgers Friday\" / \"Coachella 2027 lineup\" / [attached poster] / lineups/foo.txt"
 ---
 
-# /playlist — Build a Spotify playlist
+# /playlist — Build a Spotify playlist from any description
 
-Two modes, both wrapping the project's Python CLI (`spotify_playlist.py`):
+You are an **orchestrator**. The user describes what playlist they want in messy English (or an image, a file, a URL, whatever). Your job is to figure out what they actually want, gather any missing info via web research if needed, and call the right CLI commands. **Don't make them adapt to your tool — adapt to them.**
 
-- **Top-tracks mode** (`--artists <file>`) — playlist of top N tracks per artist from a list. Use this for festival lineups, themed lists, anything multi-artist.
-- **Concert mode** (`--setlist "<artist>"`) — playlist from the artist's most recent live setlists. Use this when the user is going to see ONE artist and wants their current tour set.
+## The primitives you have
 
-Be conversational and concise in updates — surface only what the user needs to act on.
+The Python CLI (`spotify_playlist.py`) gives you two execution modes:
 
-## Mode detection (first thing to do)
+| Mode | Flag | What it does |
+|---|---|---|
+| Top-tracks | `--artists <file>` | Playlist of top N tracks for each artist in a text file. The list-of-artists case. |
+| Concert | `--setlist "<artist>"` | Playlist from an artist's most recent live setlists. Optional `--tour "<name>"` or `--year <yyyy>` filters. The going-to-a-show case. |
 
-Read the user's message + arguments and pick a mode:
-- **Concert intent** ("I'm seeing X", "going to see X", "for X concert/tour", "setlist for X", or just an artist name with no list): → concert mode, `--setlist "<artist>"`.
-- **List intent** (attached image of a lineup, pasted multi-artist text, file path, festival mention): → top-tracks mode, `--artists lineups/<slug>.txt`.
-- **Ambiguous**: ask. e.g., "Phoebe Bridgers" alone → "Are you going to see her live (concert mode), or want a playlist of her top tracks (you can just use Spotify for that)?"
+Common flags either mode accepts: `--name`, `--description`, `--public`, `--replace` (wipe before adding), `--dry-run`, `--top N` (top-tracks), `--shows N` (concert, default 10), `--fast` (skip album-walk fallback for Spotify quota).
 
-For concert mode, you skip Steps 1-3 below (no file extraction needed) and jump straight to running the CLI with `--setlist`. The rest of the flow (verify env, dry-run, review, confirm, write) is the same.
+Everything else is YOU figuring out which primitive to call with what arguments — and using web research, vision, file I/O to bridge the gap between the user's words and those arguments.
 
 ---
 
-## Step 0 — Environment check
+## Step 0 — Environment check (always first, just once per session)
 
-Before doing anything else, verify the working directory has what's needed:
-
-1. `test -f .env && test -f spotify_playlist.py && test -d lineups`
-2. Pick the Python interpreter: prefer `.venv/bin/python` if it exists, fall back to `python3`. Store the choice — use it for every CLI invocation below.
-3. Check for `LASTFM_API_KEY` in `.env` (just grep). If absent, mention to the user: "You don't have a Last.fm API key configured — without it, the script will use Spotify's API for discovery, which has a tight daily quota (~150 calls/day) and may not complete a large lineup in one session. Get a free key at https://www.last.fm/api/account/create (takes ~1 min) for much faster builds. Want to set that up first, or proceed with Spotify-only?"
-
-If `.env` is missing entirely, point the user at README §1 (register Spotify app + create `.env`). If `.venv` is missing, suggest: `python3 -m venv .venv && .venv/bin/pip install spotipy python-dotenv requests`. Don't proceed until these are in place.
-
-## Step 1 — Identify the input source
-
-Look at the arguments (`$ARGUMENTS`) and the conversation context:
-
-- **Attached image** (festival poster, lineup graphic, screenshot) → use vision to extract every artist name visible. Don't skip smaller print — sub-headliners, late-night sets, side stages all matter. List the artists back to the user for a quick visual check before saving.
-- **Pasted text** in the user's message → parse line by line, one artist per line.
-- **File path** that exists (typically `lineups/*.txt`) → use directly, skip extraction.
-- **Nothing provided** → ask: "Paste your artists, attach a poster image, or point me at an existing file in `lineups/`."
-
-Combine sources if the user provides more than one (e.g., poster + a few hand-typed additions).
-
-## Step 2 — Pick a playlist name and lineup filename
-
-Derive the playlist name from the user's message if they gave one (e.g., "ACL Fest 26", "summer 2026"). Otherwise ask.
-
-The lineup filename is a slugified version of the name: lowercase, alphanumeric, underscores for spaces. `ACL Fest 26` → `lineups/acl_fest_26.txt`. If the file already exists, ask before overwriting — they may have manual overrides already.
-
-## Step 3 — Save the lineup file
-
-Write the extracted artists to `lineups/<slug>.txt` with a brief header comment naming the source (poster, paste, etc.) and the date. One artist per line. No pipe-overrides at this stage — those get added during review.
-
-## Step 4 — Dry run
-
-For top-tracks mode:
 ```bash
-<python> spotify_playlist.py --artists lineups/<slug>.txt --name "<playlist>" --dry-run
+test -f .env && test -f spotify_playlist.py && test -d lineups
 ```
 
-For concert mode (requires `SETLISTFM_API_KEY` in `.env`):
-```bash
-<python> spotify_playlist.py --setlist "<artist>" --shows 10 --dry-run
+Pick the Python interpreter: prefer `.venv/bin/python` if it exists, fall back to `python3`. Use that for every CLI call below.
+
+Grep `.env` for what's configured:
+- `SPOTIPY_*` — required (playlist write). If missing, point to README §1.
+- `LASTFM_API_KEY` — strongly recommended for top-tracks mode. Without it, Spotify's ~150 calls/day quota becomes the bottleneck. If absent and the user wants a large list, mention this and offer to wait while they set one up (https://www.last.fm/api/account/create, instant).
+- `SETLISTFM_API_KEY` — required only for concert mode. If absent and they want concert mode, point to https://www.setlist.fm/settings/api (instant).
+
+If `.venv` is missing: `python3 -m venv .venv && .venv/bin/pip install spotipy python-dotenv requests`.
+
+---
+
+## Read the intent
+
+The user's input might be any of these. Pick the matching pattern:
+
+| What they say / show | What they probably want | Which primitive |
+|---|---|---|
+| Attached image (poster, lineup graphic, screenshot) | Playlist of those artists | Top-tracks |
+| Pasted multi-line list of names | Same | Top-tracks |
+| Path to an existing `lineups/*.txt` | Same, skip extraction | Top-tracks |
+| "I'm seeing X" / "going to X" / "for the X show" | Concert mode | `--setlist "X"` |
+| "X's [tour-name] tour" | Concert mode with tour filter | `--setlist + --tour` |
+| "X 2019" / "X at Lollapalooza last year" | Concert mode with year filter | `--setlist + --year` |
+| Festival/event name + year ("Coachella 2027", "ACL 26", "Outside Lands") | Lineup-based playlist | Web-research lineup → top-tracks |
+| Just an artist name, no other context | Genuinely ambiguous | Ask once |
+
+When in doubt, take your best guess and confirm in one sentence: "Sounds like you want a playlist of what Phoebe Bridgers is playing on her current tour — that right, or did you mean something else?"
+
+---
+
+## Web research patterns
+
+You have `WebSearch` and `WebFetch`. Use them when the user's description references info that isn't in their message.
+
+### Researching a festival lineup
+
+When the user names a festival/event but doesn't paste the artist list:
+
+1. `WebSearch` for `"<festival> <year> lineup"` or `"<festival> <year> all artists"`. Look for the official site or a comprehensive list (Wikipedia is often good).
+2. `WebFetch` the most-promising URL and extract the FULL artist list — headliners AND smaller acts. Side stages count.
+3. Tell the user the count and a few sample names: "I found 124 artists for ACL 2026 from their site (headliners include Charli XCX, RÜFÜS DU SOL, Twenty One Pilots …). Saving as `lineups/acl_2026.txt`."
+4. Confirm before writing if the count is dramatically off from expectation.
+
+### Researching a tour name
+
+When the user says "his current tour" or "the Sable tour" without specifics:
+
+1. `WebSearch` for `"<artist> current tour 2026"` or `"<artist> tour name"`.
+2. If you find a clear tour name, use it as `--tour "<name>"`. If you don't, just skip the filter — `--shows 10` will pull recent setlists anyway, which is probably what they want.
+
+### Don't over-research
+
+Three searches max for one request, unless the user explicitly asks for thoroughness. Cost the user's patience, not just API quota. If you can't find what you need quickly, just ask them.
+
+---
+
+## Execution patterns
+
+### Pattern A — Festival from a name only
+
+```
+1. WebSearch + WebFetch to extract full lineup
+2. Slugify name → write to lineups/<slug>.txt
+3. <python> spotify_playlist.py --artists lineups/<slug>.txt --name "<derived>" --dry-run
+4. Review loop (see below)
+5. Confirm → real run
 ```
 
-Capture stdout+stderr to `/tmp/playlist_dryrun.log` for parsing. Don't show the user the raw log unless they ask — just the summary.
+### Pattern B — Concert / single artist live
 
-For concert mode specifically: surface the number of tracks resolved (e.g., "Pulled 10 setlists, got 27 unique tracks on Spotify"). Worth noting if any cover songs are included and which artists they're from — could surprise the user.
+```
+1. (Optional) WebSearch for tour name if user said "current tour" etc.
+2. <python> spotify_playlist.py --setlist "<artist>" [--tour ...] [--year ...] [--shows N] --dry-run
+3. Surface track count + cover-artist sample
+4. Confirm → real run (name auto-derives if omitted)
+```
 
-## Step 5 — Review loop
+### Pattern C — Image attachment
 
-Parse the dry-run output. Two interesting sections:
+```
+1. Vision-extract all artists. Don't skip smaller print — sub-headliners,
+   late-night sets, side stages all matter.
+2. List artists back to user for visual sanity-check.
+3. Continue as Pattern A from step 2.
+```
 
-- **`Failed (N)`** — artists where no playable tracks were found
-- **`Review needed (N)`** — same-name ambiguity or name mismatches
+### Pattern D — Existing file path
 
-For each failed or low-confidence artist, present the **display name + matched artist name + top track + alternatives** to the user. Offer three options per artist:
-1. **Looks right, keep it** — leave the entry alone
-2. **Wrong artist** — ask for a Spotify URL, then update the lineup file's line with the override (`Display Name|<url>`)
-3. **Skip / drop** — comment out the line (`# Display Name`)
+```
+1. Skip extraction.
+2. <python> spotify_playlist.py --artists <path> --name "<derived>" --dry-run
+3. Continue as Pattern A from step 4.
+```
 
-After applying any overrides, re-run the dry-run. Loop until the user is satisfied or until no more issues remain.
+### Compound asks (most realistic case)
 
-The cache makes re-runs cheap — only changed entries hit the API.
+"Playlist for Lollapalooza but only the hip-hop artists" → Pattern A + filter the extracted lineup yourself before writing the file. "Bon Iver Sable tour" → Pattern B with `--tour "Sable"` (researched first if you don't already know). "Coachella 2027 weekend 1 only" → Pattern A + filter to weekend-1 acts.
 
-## Step 6 — Check for existing playlist with same name
+---
 
-Before the real run, see if a playlist with the same name already exists in the user's account. Use a quick Python snippet via Bash:
+## Review loop (top-tracks mode only)
+
+After the dry-run, the script's output has two sections worth surfacing:
+
+- **`Failed (N)`** — no tracks found at all
+- **`Review needed (N)`** — same-name ambiguity or name mismatch
+
+For each, present **display name + matched artist + top track + alternatives** to the user. Offer three actions:
+1. **Keep** (it's right) — leave the line alone
+2. **Override** — ask for the right Spotify URL, append `|<url>` to the line in the lineup file
+3. **Drop** — comment the line out (`#`)
+
+Apply changes, re-run the dry-run. Cache makes re-runs nearly free. Loop until clean or user is satisfied.
+
+Concert mode usually doesn't need this — Setlist.fm's artist match is explicit (one match, you've already shown them the name).
+
+---
+
+## Existing-playlist check (before any real write)
 
 ```python
 import spotipy
@@ -115,45 +173,32 @@ while True:
         break
     offset += 50
 if existing:
-    # Spotify renamed `tracks` → `items` in Feb 2026; spotipy still exposes it
-    # but the count is on the original object.
     total = existing.get("tracks", {}).get("total", "?")
     print(f"EXISTS:{existing['id']}:{total}")
 else:
     print("NEW")
 ```
 
-If `EXISTS:...`, tell the user: "A playlist called '<name>' already exists with <N> tracks. **Append** new tracks, or **wipe and rebuild**?" Pass `--replace` to the CLI for wipe; omit it for append (default).
-
-## Step 7 — Confirm and create
-
-Confirm with the user:
-- Public or private (default: private)
-- Description (optional — suggest something based on the source, e.g. "Top tracks per artist · ACL 2026 lineup")
-- Append vs. replace (from step 6)
-
-Then run for real.
-
-For top-tracks mode:
-```bash
-<python> spotify_playlist.py --artists lineups/<slug>.txt --name "<playlist>" \
-    [--public] [--replace] [--description "..."]
-```
-
-For concert mode (name auto-derives to "<Artist> — Recent Live" if you don't pass `--name`):
-```bash
-<python> spotify_playlist.py --setlist "<artist>" --shows 10 \
-    [--public] [--replace] [--name "<custom>"] [--description "..."]
-```
-
-When it finishes, report the playlist URL from the script's final line.
+If `EXISTS:...:N`, ask: "A playlist named '<name>' already exists with N tracks. **Append** new tracks, or **wipe and rebuild**?" Pass `--replace` for wipe.
 
 ---
 
-## Notes for Claude
+## Final run
 
-- **Be terse during execution.** Don't echo the entire dry-run log; summarize and surface only flagged artists.
-- **Be honest about misses.** If the script can't find tracks for an artist (legitimate Spotify gap), tell the user; don't pretend it succeeded.
-- **Rate limit handling.** If a run hits Spotify's daily quota (Retry-After ~72000s), stop immediately (don't let spotipy sleep through it — kill the python process), explain the user is locked out for ~24h, and suggest setting `LASTFM_API_KEY` if they haven't already. With Last.fm configured, discovery doesn't touch Spotify's quota and a fresh build of 100+ artists takes under 2 minutes.
-- **Cache awareness.** Mention how many cache hits vs new resolutions there were (`X/Y from cache`) — gives the user a sense of cost. With Last.fm, even fresh resolutions are nearly free.
-- **No autonomous invocation.** This skill has `disable-model-invocation: true` — the user must explicitly type `/playlist`. Don't try to invoke it on their behalf in other contexts.
+Confirm:
+- Public or private (default private)
+- Description (suggest something based on source: "Top tracks per artist · ACL 2026 lineup", "Phoebe Bridgers — last 10 shows" — short and self-explanatory)
+- Append vs. replace
+
+Run for real. Report the playlist URL from the script's final line.
+
+---
+
+## Operating notes
+
+- **Be terse during execution.** Don't echo full logs — summarize. The user wants to know what's flagged for review and what worked, not every line.
+- **Be honest about misses.** If the script can't find tracks for an artist (legit Spotify gap), say so. Don't pretend.
+- **Web research is a budget.** Three searches per request max unless the user signals they want thoroughness. They're describing playlists, not asking for dissertations.
+- **Rate limit handling.** Spotify daily quota is ~150 calls per rolling 24h. If hit, kill the Python process immediately (don't let spotipy sleep through a 24h Retry-After) and explain. With `LASTFM_API_KEY` set, discovery doesn't touch Spotify's quota.
+- **Cache awareness.** Top-tracks mode caches per-artist; mention cache hits vs new ("100/120 from cache, 20 new resolutions"). Concert mode doesn't cache (setlists change as artists play new shows — and the API is cheap).
+- **No autonomous invocation.** `disable-model-invocation: true` — the user must type `/playlist`. Don't try to launch this on their behalf in other conversations.

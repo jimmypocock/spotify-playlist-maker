@@ -183,10 +183,17 @@ def _via_lastfm(
 # ---------- concert mode (Setlist.fm) ----------
 
 def fetch_setlist_tracks(
-    artist_name: str, shows: int, api_key: str,
+    artist_name: str,
+    shows: int,
+    api_key: str,
+    tour: Optional[str] = None,
+    year: Optional[int] = None,
 ) -> ResolveResult:
     """Build a ResolveResult by pulling the most recent live setlists for an
     artist and mapping the songs to Spotify URIs.
+
+    Optional `tour` and `year` filters narrow the fetch (e.g. "Reset Tour"
+    or year=2025). Filter caveats — see clients/setlistfm.fetch_recent_setlists.
 
     Cover handling: each cover song is looked up first under the performer
     (the artist whose setlist we're reading) — if Spotify has their recording
@@ -210,9 +217,14 @@ def fetch_setlist_tracks(
     result.artist_id = mbid  # MBID not Spotify ID; cli code shouldn't care
     result.matched_name = canonical
 
-    setlists = setlistfm.fetch_recent_setlists(mbid, shows, api_key)
+    setlists = setlistfm.fetch_recent_setlists(
+        mbid, shows, api_key, tour=tour, year=year,
+    )
     if not setlists:
-        result.error = "no setlists found"
+        filter_note = ""
+        if tour or year:
+            filter_note = f" (filters: tour={tour!r} year={year})"
+        result.error = f"no setlists found{filter_note}"
         return result
 
     # Walk every setlist, collect songs in order, dedupe by (performer, title).

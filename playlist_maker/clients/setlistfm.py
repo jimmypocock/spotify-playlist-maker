@@ -67,18 +67,44 @@ def search_artist_mbid(artist_name: str, api_key: str) -> Optional[tuple[str, st
 
 
 def fetch_recent_setlists(
-    artist_mbid: str, max_setlists: int, api_key: str
+    artist_mbid: str,
+    max_setlists: int,
+    api_key: str,
+    tour: Optional[str] = None,
+    year: Optional[int] = None,
 ) -> list[dict]:
     """Fetch up to max_setlists most-recent setlists for the artist (newest
     first, past dates only — skips future-scheduled shows). 20 per page;
-    paginates as needed. Empty/no-songs-yet setlists are filtered out."""
+    paginates as needed. Empty/no-songs-yet setlists are filtered out.
+
+    Optional filters use Setlist.fm's `search/setlists` endpoint instead of
+    the plain `artist/{mbid}/setlists` listing:
+    - `tour`: tour name (e.g. "Reset Tour"). Caveat — Setlist.fm tour-name
+      data is community-submitted and patchy. Setlists from the same tour
+      that just don't have `tour.name` populated will be missed.
+    - `year`: 4-digit year. Reliable since it's just a date range.
+
+    When either filter is set we switch endpoints; without filters we use
+    the cheaper artist/{mbid}/setlists path.
+    """
+    if tour or year:
+        endpoint = f"{SETLISTFM_API}/search/setlists"
+        base_params: dict = {"artistMbid": artist_mbid}
+        if tour:
+            base_params["tourName"] = tour
+        if year:
+            base_params["year"] = year
+    else:
+        endpoint = f"{SETLISTFM_API}/artist/{artist_mbid}/setlists"
+        base_params = {}
+
     setlists: list[dict] = []
     page = 1
     while len(setlists) < max_setlists:
         try:
             r = requests.get(
-                f"{SETLISTFM_API}/artist/{artist_mbid}/setlists",
-                params={"p": page},
+                endpoint,
+                params={**base_params, "p": page},
                 headers=_headers(api_key),
                 timeout=10,
             )
