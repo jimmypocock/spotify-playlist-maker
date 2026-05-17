@@ -111,21 +111,40 @@ The intended workflow stays the same: dry-run → review block surfaces uncertai
 ## File layout
 
 ```
-spotify_playlist.py             # generic CLI — committed
+spotify_playlist.py                  # thin entry-point shim — `from playlist_maker.cli import main`
+playlist_maker/
+  __init__.py
+  cli.py                             # argparse + main orchestration loop + summary
+  models.py                          # ArtistEntry, ArtistCandidate, ResolveResult,
+                                     #   parse_artist_override, normalize_name
+  cache.py                           # load/save/hydrate .resolution_cache.json
+  confidence.py                      # score_confidence + print_review_block
+  clients/                           # thin wrappers around external APIs — one file per service
+    spotify.py                       # auth + every Spotify call we make
+    lastfm.py                        # artist.getTopTracks
+    listenbrainz.py                  # spotify-id-from-metadata batch mapping
+  services/                          # business logic composing clients
+    resolver.py                      # resolve_artist + fetch_top_tracks (Last.fm-first chain)
+    playlist.py                      # get_or_create + replace + dedupe + add batches
+
 .claude/
   skills/
     playlist/
-      SKILL.md                  # /playlist slash command — committed
-  settings.local.json           # per-user Claude Code prefs — gitignored
+      SKILL.md                       # /playlist slash command — committed
+  settings.local.json                # per-user Claude Code prefs — gitignored
 lineups/
-  example.txt                   # generic example — committed
-  <name>.txt                    # user's actual lineups — gitignored
-.resolution_cache.json          # per-artist cache — gitignored
-.spotify_cache                  # spotipy OAuth token — gitignored
-.env                            # credentials — gitignored
+  example.txt                        # generic example — committed
+  <name>.txt                         # user's actual lineups — gitignored
+.resolution_cache.json               # per-artist cache — gitignored
+.spotify_cache                       # spotipy OAuth token — gitignored
+.env                                 # credentials — gitignored
 ```
 
 The `.gitignore` enforces: any file in `lineups/` except `example.txt` is local-only; all caches, credentials, and per-user Claude state are local-only.
+
+**Reading the tree**: `clients/` is one file per external API (Spotify, Last.fm, ListenBrainz). `services/` composes those clients to do real work (resolution, playlist writing). `models`/`cache`/`confidence` are standalone concerns at the package root. `cli.py` wires it into the user-facing command. The root `spotify_playlist.py` is a 12-line shim that exists only so `python spotify_playlist.py …` (what the README and `/playlist` skill invoke) still works without needing a pip install.
+
+Most files are well under 100 lines; the two orchestration files (`cli.py`, `services/resolver.py`) are ~220 lines each. When adding a new discovery source (e.g. Setlist.fm), add `clients/<name>.py` and either extend `services/resolver.py` or create a sibling `services/<purpose>_resolver.py` — that's the seam the structure was designed around.
 
 ## Skill layer
 
