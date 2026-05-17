@@ -76,6 +76,26 @@ Critical: when the Last.fm path succeeds, `result.matched_name` is forced to `en
 
 If `LASTFM_API_KEY` is absent, the script falls back to pure-Spotify resolution — slower but still works. The Last.fm path requires no other configuration.
 
+### Concert mode (Setlist.fm)
+
+When invoked with `--setlist "<artist>"` instead of `--artists <file>`, the script switches to a completely different discovery path:
+
+1. `clients/setlistfm.py:search_artist_mbid()` — resolves the artist name to a MusicBrainz ID via Setlist.fm's `/search/artists?sort=relevance`.
+2. `clients/setlistfm.py:fetch_recent_setlists()` — pulls up to `--shows N` setlists (newest first, past dates only). Empty-tracklist setlists (artist played but tracks not entered yet) are filtered.
+3. `services/resolver.py:fetch_setlist_tracks()` — orchestrates the above + ListenBrainz mapping in two passes:
+   - **Pass 1**: batch-look up every song under the performing artist (handles non-covers, plus the case where the performer released a studio recording of a cover they play live).
+   - **Pass 2**: any cover that didn't resolve under the performer falls back to the original artist (Setlist.fm's `song.cover.name`).
+   Result is one URI per song, deduped, in setlist order.
+
+Important Setlist.fm quirks baked into the client:
+- `song.tape == true` means walk-on/intro music — skipped (not actually performed).
+- `song.cover.name` is the ORIGINAL artist (not the performer). Setlist's top-level `artist` is the performer.
+- Rate limit is **2 req/sec** enforced strictly — `SETLISTFM_SLEEP = 1.1s` keeps us safe.
+- Date format is `dd-MM-yyyy` (European), not ISO.
+- Default content type is XML — always send `Accept: application/json`.
+
+Concert mode does NOT use the resolution cache (setlists change as artists play new shows; cheap to re-fetch). Only the top-tracks mode uses `.resolution_cache.json`.
+
 ### Other Feb 2026 endpoint surprises actually hit
 
 Found empirically while writing the playlist phase:
@@ -123,8 +143,10 @@ playlist_maker/
     spotify.py                       # auth + every Spotify call we make
     lastfm.py                        # artist.getTopTracks
     listenbrainz.py                  # spotify-id-from-metadata batch mapping
+    setlistfm.py                     # artist search + recent setlists + cover extraction
   services/                          # business logic composing clients
     resolver.py                      # resolve_artist + fetch_top_tracks (Last.fm-first chain)
+                                     #   + fetch_setlist_tracks (concert mode)
     playlist.py                      # get_or_create + replace + dedupe + add batches
 
 .claude/

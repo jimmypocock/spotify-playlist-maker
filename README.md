@@ -1,11 +1,16 @@
 # Spotify Playlist Maker
 
-Generate a Spotify playlist of the top N tracks for every artist in a list. Built for festival lineups originally — works for any list of artists you want to compile into a playlist.
+Generate a Spotify playlist from a list of artists OR from an artist's recent live setlists. Built for festival lineups originally — works for any list of artists, or now for "I'm going to a concert, what are they playing?"
 
-Two ways to use it, both run from inside the cloned repo:
+**Two modes:**
 
-- **CLI**: `python spotify_playlist.py --artists <file> --name "<playlist>"`. Self-contained, scriptable.
-- **`/playlist` in Claude Code**: launch Claude Code from inside this directory and type `/playlist`. Attach a poster image, paste an artist list, or pass a `lineups/<name>.txt` path. Claude does vision extraction, walks you through review, and creates the playlist.
+- **Top-tracks mode** — `--artists <file>`: build a playlist of the top N tracks per artist from a text file. Use this for festival lineups, themed lists, etc.
+- **Concert mode** — `--setlist "<artist>"`: build a playlist from the artist's most recent live setlists. Use this when you're going to see someone and want to know their current tour set.
+
+**Two ways to invoke, both run from inside the cloned repo:**
+
+- **CLI**: `python spotify_playlist.py [--artists <file> | --setlist "<artist>"] ...`. Scriptable.
+- **`/playlist` in Claude Code**: launch Claude Code from inside this directory and type `/playlist`. Attach a poster image, paste an artist list, point at a `lineups/<name>.txt` path, or ask for a concert playlist. Claude does vision extraction / orchestration, walks you through review, and creates the playlist.
 
 The `/playlist` skill is project-scoped (lives in `.claude/skills/`), so it's available automatically once you've cloned the repo. No marketplace install yet — that's planned for a later version. For now: clone, set up, run.
 
@@ -33,6 +38,14 @@ Spotify's Dev Mode daily quota is brutally tight — about 150-200 calls per 24h
 
 You can skip this step — the script will work without it — but a 100-artist build will then take 3-4 days to complete due to Spotify's quota.
 
+### 2b. Get a Setlist.fm API key (only if you want concert mode)
+
+1. Go to https://www.setlist.fm/settings/api (you'll need to be logged into a regular Setlist.fm account first — sign up at https://www.setlist.fm/signup if you don't have one).
+2. Click "request an API key" — fill in app name and short description.
+3. **Key is instant** for the default (free) tier. Add it to `.env` as `SETLISTFM_API_KEY`.
+
+Default rate limit is 2 req/sec, 1440/day — plenty for occasional use.
+
 ### 3. Install dependencies
 
 ```bash
@@ -52,9 +65,14 @@ SPOTIPY_REDIRECT_URI=http://127.0.0.1:8888/callback
 
 # Optional but strongly recommended (see step 2):
 LASTFM_API_KEY=your_lastfm_api_key_here
+
+# Optional, only for concert mode (see step 2b):
+SETLISTFM_API_KEY=your_setlistfm_api_key_here
 ```
 
 ## Usage
+
+### Top-tracks mode (artist list)
 
 Put your artist list in `lineups/<your_name>.txt` (see `lineups/example.txt`). Then:
 
@@ -67,6 +85,20 @@ python spotify_playlist.py --artists lineups/<your_name>.txt --name "<playlist>"
     --top 10 --description "Top 10 tracks per artist"
 ```
 
+### Concert mode (recent setlists)
+
+When you're going to see an artist and want a playlist of what they're playing live:
+
+```bash
+# Dry run — fetches recent setlists, dedupes, maps to Spotify
+python spotify_playlist.py --setlist "Phoebe Bridgers" --shows 10 --dry-run
+
+# Real run — auto-derives playlist name as "<Artist> — Recent Live"
+python spotify_playlist.py --setlist "Phoebe Bridgers" --public
+```
+
+By default, pulls the last 10 setlists (use `--shows N` to change). Covers are included: each cover is looked up first under the performing artist (in case Spotify has their recording of it), then falls back to the original artist. Walk-on music and intro tapes are skipped automatically.
+
 **Important**: as of Feb 2026, every Dev Mode app must add its owner under **User Management** in the dashboard (Settings → User Management → Add User) — even though you own the app. Without this, every API call returns 403.
 
 First run pops a browser to authorize the app against your Spotify account. After that it caches the refresh token in `.spotify_cache` and runs silently.
@@ -75,9 +107,11 @@ First run pops a browser to authorize the app against your Spotify account. Afte
 
 | Flag            | Default | Notes                                                                       |
 |-----------------|---------|-----------------------------------------------------------------------------|
-| `--artists`     | —       | Path to your lineup file (required)                                         |
-| `--name`        | —       | Playlist name (required)                                                    |
-| `--top`         | 10      | Top N tracks per artist                                                     |
+| `--artists`     | —       | Path to your lineup file (top-tracks mode — mutually exclusive with --setlist) |
+| `--setlist`     | —       | Artist name for concert mode (mutually exclusive with --artists)            |
+| `--name`        | —       | Playlist name (required for --artists; auto-derived for --setlist)          |
+| `--top`         | 10      | Top N tracks per artist (top-tracks mode)                                   |
+| `--shows`       | 10      | Number of recent setlists to pull (setlist mode)                            |
 | `--market`      | US      | ISO country code; affects track availability                                |
 | `--description` | ""      | Playlist description                                                        |
 | `--public`      | off     | Make playlist public (default: private)                                     |

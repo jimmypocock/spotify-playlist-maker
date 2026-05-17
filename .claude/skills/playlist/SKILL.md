@@ -1,15 +1,27 @@
 ---
-description: Build a Spotify playlist of top tracks per artist. Accepts a file path, pasted artist list, or an attached image (festival poster, lineup screenshot). Uses vision to extract artists, walks the user through the review loop, and creates a playlist in their Spotify account.
+description: Build a Spotify playlist either of top tracks per artist (from a file/image/paste) OR of an artist's recent live setlists (concert mode). Uses vision to extract artists from posters, walks the user through review, and creates the playlist in their Spotify account.
 disable-model-invocation: true
 allowed-tools: Bash(.venv/bin/python *), Bash(python3 *), Bash(test *), Bash(ls *), Bash(mkdir *), Read, Write, Edit, Glob
-argument-hint: "[lineup-path] [--name \"<playlist>\"]  |  use with an attached image or pasted artist list"
+argument-hint: "[lineup-path] [--name \"<playlist>\"]  |  [concert request like \"seeing Phoebe Bridgers Friday\"]  |  use with an attached image or pasted artist list"
 ---
 
 # /playlist — Build a Spotify playlist
 
-Build a Spotify playlist of the top N tracks per artist. The user can provide artists via a file path, an attached image (festival poster, lineup screenshot), pasted text, or a combination.
+Two modes, both wrapping the project's Python CLI (`spotify_playlist.py`):
 
-This skill wraps the project's Python CLI (`spotify_playlist.py`) and guides the user through extraction → review → confirmation. Be conversational and concise in your updates — surface only the things the user needs to act on.
+- **Top-tracks mode** (`--artists <file>`) — playlist of top N tracks per artist from a list. Use this for festival lineups, themed lists, anything multi-artist.
+- **Concert mode** (`--setlist "<artist>"`) — playlist from the artist's most recent live setlists. Use this when the user is going to see ONE artist and wants their current tour set.
+
+Be conversational and concise in updates — surface only what the user needs to act on.
+
+## Mode detection (first thing to do)
+
+Read the user's message + arguments and pick a mode:
+- **Concert intent** ("I'm seeing X", "going to see X", "for X concert/tour", "setlist for X", or just an artist name with no list): → concert mode, `--setlist "<artist>"`.
+- **List intent** (attached image of a lineup, pasted multi-artist text, file path, festival mention): → top-tracks mode, `--artists lineups/<slug>.txt`.
+- **Ambiguous**: ask. e.g., "Phoebe Bridgers" alone → "Are you going to see her live (concert mode), or want a playlist of her top tracks (you can just use Spotify for that)?"
+
+For concert mode, you skip Steps 1-3 below (no file extraction needed) and jump straight to running the CLI with `--setlist`. The rest of the flow (verify env, dry-run, review, confirm, write) is the same.
 
 ---
 
@@ -46,11 +58,19 @@ Write the extracted artists to `lineups/<slug>.txt` with a brief header comment 
 
 ## Step 4 — Dry run
 
-Run:
+For top-tracks mode:
 ```bash
 <python> spotify_playlist.py --artists lineups/<slug>.txt --name "<playlist>" --dry-run
 ```
+
+For concert mode (requires `SETLISTFM_API_KEY` in `.env`):
+```bash
+<python> spotify_playlist.py --setlist "<artist>" --shows 10 --dry-run
+```
+
 Capture stdout+stderr to `/tmp/playlist_dryrun.log` for parsing. Don't show the user the raw log unless they ask — just the summary.
+
+For concert mode specifically: surface the number of tracks resolved (e.g., "Pulled 10 setlists, got 27 unique tracks on Spotify"). Worth noting if any cover songs are included and which artists they're from — could surprise the user.
 
 ## Step 5 — Review loop
 
@@ -112,10 +132,18 @@ Confirm with the user:
 - Description (optional — suggest something based on the source, e.g. "Top tracks per artist · ACL 2026 lineup")
 - Append vs. replace (from step 6)
 
-Then run for real:
+Then run for real.
+
+For top-tracks mode:
 ```bash
 <python> spotify_playlist.py --artists lineups/<slug>.txt --name "<playlist>" \
     [--public] [--replace] [--description "..."]
+```
+
+For concert mode (name auto-derives to "<Artist> — Recent Live" if you don't pass `--name`):
+```bash
+<python> spotify_playlist.py --setlist "<artist>" --shows 10 \
+    [--public] [--replace] [--name "<custom>"] [--description "..."]
 ```
 
 When it finishes, report the playlist URL from the script's final line.

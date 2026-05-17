@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -22,7 +23,7 @@ from .clients.spotify import RATE_LIMIT_SLEEP, get_client, get_playlist_url
 from .confidence import print_review_block, score_confidence
 from .models import ArtistEntry, ResolveResult
 from .services.playlist import get_or_create_playlist, write_playlist
-from .services.resolver import fetch_top_tracks, resolve_artist
+from .services.resolver import fetch_setlist_tracks, fetch_top_tracks, resolve_artist
 
 DOCSTRING = """
 spotify_playlist.py — Build a Spotify playlist of the top N tracks for every
@@ -83,9 +84,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description=DOCSTRING,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--artists", required=True, type=Path, help="path to artists.txt")
-    parser.add_argument("--name", required=True, help="playlist name")
-    parser.add_argument("--top", type=int, default=10, help="top N tracks per artist (default 10)")
+    # Mode selection — exactly one of these two must be provided.
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--artists", type=Path,
+                      help="path to a lineup file (top-tracks mode)")
+    mode.add_argument("--setlist", metavar="ARTIST",
+                      help="artist name to build a playlist of their recent live setlists "
+                           "(concert mode — requires SETLISTFM_API_KEY in .env)")
+
+    parser.add_argument("--name", help="playlist name (auto-derived in setlist mode if omitted)")
+    parser.add_argument("--top", type=int, default=10, help="top N tracks per artist (default 10, top-tracks mode only)")
+    parser.add_argument("--shows", type=int, default=10,
+                        help="number of recent setlists to pull (default 10, setlist mode only)")
     parser.add_argument("--market", default="US", help="ISO market code (default US)")
     parser.add_argument("--description", default="", help="playlist description")
     parser.add_argument("--public", action="store_true", help="make playlist public (default private)")
@@ -97,7 +107,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "accepts thin search results")
     parser.add_argument("--dry-run", action="store_true",
                         help="resolve artists & print plan, don't write")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+
+    # Top-tracks mode requires --name (no good default); setlist mode auto-derives it.
+    if args.artists and not args.name:
+        parser.error("--name is required when using --artists")
+    return args
 
 
 def _resolve_all(
@@ -170,22 +185,35 @@ def main() -> int:
 
     args = _parse_args()
 
-    if not args.artists.exists():
-        sys.exit(f"Artists file not found: {args.artists}")
+    # ---------- mode dispatch ----------
+    sp = None  # Spotify client — only authed when we actually need it
+    if args.setlist:
+        setlist_key = os.getenv("SETLISTFM_API_KEY")
+        if not setlist_key:
+            sys.exit("SETLISTFM_API_KEY not set in .env — required for setlist mode.")
+        log.info("Concert mode: fetching last %d setlists for %r", args.shows, args.setlist)
+        results = [fetch_setlist_tracks(args.setlist, args.shows, setlist_key)]
+        # Auto-derive name if omitted
+        if not args.name:
+            canonical = results[0].matched_name or args.setlist
+            args.name = f"{canonical} — Recent Live"
+            log.info("Playlist name: %r (auto-derived)", args.name)
+        _print_summary(results, Path(f"<setlist:{args.setlist}>"))
+    else:
+        if not args.artists.exists():
+            sys.exit(f"Artists file not found: {args.artists}")
+        entries = load_artists(args.artists)
+        log.info("Loaded %d artists from %s", len(entries), args.artists)
 
-    entries = load_artists(args.artists)
-    log.info("Loaded %d artists from %s", len(entries), args.artists)
-
-    sp = get_client()
-    log.info("Authenticated as %s", sp.current_user()["display_name"])
-    time.sleep(RATE_LIMIT_SLEEP)
-
-    # Phase 1: resolve every artist and collect top tracks
-    results = _resolve_all(
-        sp, entries, Path(RESOLUTION_CACHE_PATH),
-        args.top, args.market, fast=args.fast,
-    )
-    _print_summary(results, args.artists)
+        sp = get_client()
+        log.info("Authenticated as %s", sp.current_user()["display_name"])
+        time.sleep(RATE_LIMIT_SLEEP)
+        # Phase 1: resolve every artist and collect top tracks
+        results = _resolve_all(
+            sp, entries, Path(RESOLUTION_CACHE_PATH),
+            args.top, args.market, fast=args.fast,
+        )
+        _print_summary(results, args.artists)
 
     if args.dry_run:
         log.info("Dry run complete. No playlist written.")
@@ -193,7 +221,14 @@ def main() -> int:
 
     found = [r for r in results if r.track_uris]
     if not found:
-        sys.exit("No artists resolved; nothing to write.")
+        sys.exit("Nothing resolved; nothing to write.")
+
+    # Setlist mode skipped Spotify auth above (discovery doesn't need it).
+    # Now we need it for the write phase.
+    if sp is None:
+        sp = get_client()
+        log.info("Authenticated to Spotify as %s", sp.current_user()["display_name"])
+        time.sleep(RATE_LIMIT_SLEEP)
 
     # Phase 2: write playlist
     playlist_id = get_or_create_playlist(sp, args.name, args.description, args.public)

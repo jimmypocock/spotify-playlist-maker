@@ -20,7 +20,7 @@ from typing import Optional
 
 import spotipy
 
-from ..clients import lastfm, listenbrainz
+from ..clients import lastfm, listenbrainz, setlistfm
 from ..clients.spotify import (
     list_album_tracks,
     list_artist_albums,
@@ -178,6 +178,98 @@ def _via_lastfm(
         if len(uris) >= n:
             break
     return uris, first_name
+
+
+# ---------- concert mode (Setlist.fm) ----------
+
+def fetch_setlist_tracks(
+    artist_name: str, shows: int, api_key: str,
+) -> ResolveResult:
+    """Build a ResolveResult by pulling the most recent live setlists for an
+    artist and mapping the songs to Spotify URIs.
+
+    Cover handling: each cover song is looked up first under the performer
+    (the artist whose setlist we're reading) — if Spotify has their recording
+    of the cover, use that. Otherwise fall back to the original artist
+    (Setlist.fm's `cover.name`). One URI per cover.
+
+    Songs are deduped by Spotify URI across all the setlists fetched. Order
+    is roughly "earliest mention wins" — newest setlist's order first, then
+    progressively older.
+    """
+    # We synthesize a minimal ArtistEntry so the result shape matches what
+    # the rest of the pipeline expects (cli/output).
+    entry = ArtistEntry(display_name=artist_name, search_query=artist_name)
+    result = ResolveResult(entry=entry, matched_name=artist_name)
+
+    found = setlistfm.search_artist_mbid(artist_name, api_key)
+    if not found:
+        result.error = "artist not found on Setlist.fm"
+        return result
+    mbid, canonical = found
+    result.artist_id = mbid  # MBID not Spotify ID; cli code shouldn't care
+    result.matched_name = canonical
+
+    setlists = setlistfm.fetch_recent_setlists(mbid, shows, api_key)
+    if not setlists:
+        result.error = "no setlists found"
+        return result
+
+    # Walk every setlist, collect songs in order, dedupe by (performer, title).
+    songs_in_order: list[tuple[str, str, Optional[str]]] = []
+    seen_pair: set[tuple[str, str]] = set()
+    for sl in setlists:
+        for title, performer, original in setlistfm.extract_songs(sl):
+            key = (performer.lower(), title.lower())
+            if key in seen_pair:
+                continue
+            seen_pair.add(key)
+            songs_in_order.append((title, performer, original))
+
+    # Pass 1: try ListenBrainz under the performer for every song (one batch
+    # per performer — in single-artist mode that's just one big batch).
+    by_performer: dict[str, list[str]] = {}
+    for title, performer, _ in songs_in_order:
+        by_performer.setdefault(performer, []).append(title)
+    performer_map: dict[str, dict[str, Optional[str]]] = {
+        p: listenbrainz.map_tracks_to_spotify(p, titles)
+        for p, titles in by_performer.items()
+    }
+
+    # Pass 2: any cover that didn't resolve under the performer falls back to
+    # the original artist (Spotify almost always has the original recording).
+    fallback_needed: dict[str, list[str]] = {}
+    for title, performer, original in songs_in_order:
+        if not original:
+            continue
+        if performer_map.get(performer, {}).get(title):
+            continue
+        fallback_needed.setdefault(original, []).append(title)
+    original_map: dict[str, dict[str, Optional[str]]] = {
+        a: listenbrainz.map_tracks_to_spotify(a, titles)
+        for a, titles in fallback_needed.items()
+    }
+
+    # Assemble final URIs in setlist order.
+    uris: list[str] = []
+    seen_uris: set[str] = set()
+    sample: Optional[str] = None
+    for title, performer, original in songs_in_order:
+        uri = performer_map.get(performer, {}).get(title)
+        if not uri and original:
+            uri = original_map.get(original, {}).get(title)
+        if not uri or uri in seen_uris:
+            continue
+        uris.append(uri)
+        seen_uris.add(uri)
+        if sample is None:
+            sample = title
+
+    result.track_uris = uris
+    result.sample_track = sample
+    if not uris:
+        result.error = "no setlist tracks mapped to Spotify"
+    return result
 
 
 def _walk_albums(
