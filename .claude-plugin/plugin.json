@@ -1,0 +1,13 @@
+{
+  "name": "spotify-playlist-maker",
+  "version": "0.2.0",
+  "description": "Build a Spotify playlist from any description — festival lineup image, pasted artist list, concert you're going to, tour name, single artist, a vibe. The /playlist skill orchestrates a Python CLI that pulls artists via Last.fm + ListenBrainz (free), recent setlists via Setlist.fm, and writes to your Spotify account.",
+  "author": {
+    "name": "Jimmy Pocock",
+    "url": "https://github.com/jimmypocock"
+  },
+  "homepage": "https://github.com/jimmypocock/spotify-playlist-maker",
+  "repository": "https://github.com/jimmypocock/spotify-playlist-maker",
+  "license": "MIT",
+  "keywords": ["spotify", "playlist", "music", "festival", "concert", "setlist"]
+}

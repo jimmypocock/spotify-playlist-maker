@@ -13,7 +13,7 @@ Strict separation between generic and specific content:
 
 When adding features, default to making them reusable across input lists. When adding files, decide explicitly whether each one is generic (committed) or specific (gitignored, in `lineups/` or hidden at root).
 
-A Claude Code skill wraps the CLI: `.claude/skills/playlist/SKILL.md` defines the `/playlist` slash command. It's project-scoped — auto-loaded when Claude Code runs from inside a clone of this repo. Marketplace distribution (proper plugin format with `.claude-plugin/plugin.json`) is intentionally deferred until v0.2; current scope is "clone and use." See "Skill layer" section below.
+A Claude Code plugin wraps the CLI: `skills/playlist/SKILL.md` defines the `/playlist` slash command, packaged with `.claude-plugin/plugin.json`. Distribution is via Claude Code's plugin marketplace — users `/plugin install spotify-playlist-maker`, no clone needed. See "Skill layer" section below.
 
 ## Commands
 
@@ -138,6 +138,7 @@ playlist_maker/
   models.py                          # ArtistEntry, ArtistCandidate, ResolveResult,
                                      #   parse_artist_override, normalize_name
   cache.py                           # load/save/hydrate .resolution_cache.json
+  config.py                          # config-dir resolution (env var → ~/.spotify-playlist-maker/ → CWD)
   confidence.py                      # score_confidence + print_review_block
   clients/                           # thin wrappers around external APIs — one file per service
     spotify.py                       # auth + every Spotify call we make
@@ -149,20 +150,26 @@ playlist_maker/
                                      #   + fetch_setlist_tracks (concert mode)
     playlist.py                      # get_or_create + replace + dedupe + add batches
 
+.claude-plugin/
+  plugin.json                        # plugin manifest (name, version, repo) — committed
+skills/
+  playlist/
+    SKILL.md                         # /playlist slash command — committed
 .claude/
-  skills/
-    playlist/
-      SKILL.md                       # /playlist slash command — committed
   settings.local.json                # per-user Claude Code prefs — gitignored
 lineups/
   example.txt                        # generic example — committed
-  <name>.txt                         # user's actual lineups — gitignored
-.resolution_cache.json               # per-artist cache — gitignored
-.spotify_cache                       # spotipy OAuth token — gitignored
-.env                                 # credentials — gitignored
+  <name>.txt                         # dev-mode lineups when working in this repo — gitignored
+
+# Plugin users get a separate config dir (not in this tree):
+~/.spotify-playlist-maker/
+  .env                               # credentials
+  .spotify_cache                     # spotipy OAuth token
+  .resolution_cache.json             # per-artist cache
+  lineups/                           # generated + override lineup files
 ```
 
-The `.gitignore` enforces: any file in `lineups/` except `example.txt` is local-only; all caches, credentials, and per-user Claude state are local-only.
+The `.gitignore` enforces: any file in `lineups/` except `example.txt` is local-only; all caches, credentials, and per-user Claude state are local-only. The `config.py` module resolves which directory to use at runtime — `$SPOTIFY_PLAYLIST_CONFIG_DIR` if set, else `~/.spotify-playlist-maker/` if it exists, else CWD (the dev case inside this repo).
 
 **Reading the tree**: `clients/` is one file per external API (Spotify, Last.fm, ListenBrainz). `services/` composes those clients to do real work (resolution, playlist writing). `models`/`cache`/`confidence` are standalone concerns at the package root. `cli.py` wires it into the user-facing command. The root `spotify_playlist.py` is a 12-line shim that exists only so `python spotify_playlist.py …` (what the README and `/playlist` skill invoke) still works without needing a pip install.
 
@@ -172,21 +179,23 @@ Most files are well under 100 lines; the two orchestration files (`cli.py`, `ser
 
 The `/playlist` skill is the user-facing entry point. It's a thin orchestrator that:
 
-1. Decides whether the input is an attached image (vision-extract), pasted text, or a file path.
-2. Slugifies a filename, writes the extracted artists to `lineups/<slug>.txt`.
-3. Shells out to `spotify_playlist.py` for the dry-run, parses the `Failed` and `Review needed` sections, and walks the user through each flagged artist (keep / override / drop).
-4. Checks for an existing same-named playlist and asks append-vs-replace before the real run.
-5. Re-invokes the CLI without `--dry-run` for the final write.
+1. Detects first-run (no `~/.spotify-playlist-maker/.env`) and walks the user through Spotify dev app setup + key collection.
+2. Decides whether the input is an attached image (vision-extract), pasted text, or a file path.
+3. Slugifies a filename, writes the extracted artists to `~/.spotify-playlist-maker/lineups/<slug>.txt`.
+4. Shells out to `python3 ${CLAUDE_PLUGIN_ROOT}/spotify_playlist.py` for the dry-run, parses the `Failed` and `Review needed` sections, and walks the user through each flagged artist (keep / override / drop).
+5. Checks for an existing same-named playlist and asks append-vs-replace before the real run.
+6. Re-invokes the CLI without `--dry-run` for the final write.
 
-The skill has `disable-model-invocation: true` — only the user can trigger it via `/playlist`, never Claude autonomously. `allowed-tools` pre-approves the CLI invocations (`.venv/bin/python *` and `python3 *`) so the user isn't permission-prompted mid-flow.
+The skill has `disable-model-invocation: true` — only the user can trigger it via `/playlist`, never Claude autonomously. `allowed-tools` pre-approves `Bash(python3 *)` so the user isn't permission-prompted mid-flow.
 
 When extending: keep all Spotify API logic in the Python CLI (so it stays scriptable without Claude). The skill should only do UX, input extraction, and orchestration — not duplicate the resolution/caching/playlist logic.
 
-### Path to marketplace distribution (v0.2+)
+### Dev workflow vs. plugin-install workflow
 
-To go from project-scoped skill to installable plugin:
-1. Move `.claude/skills/playlist/SKILL.md` → `skills/playlist/SKILL.md`
-2. Add `.claude-plugin/plugin.json` with manifest (name, version, description, repository).
-3. Skill name becomes namespaced as `<plugin-name>:playlist` for users who install via `/plugin marketplace add ... && /plugin install ...`.
+The CLI is **dual-mode** on purpose. Inside this repo, `python spotify_playlist.py --artists lineups/foo.txt …` still works — `config.py` falls back to CWD when `~/.spotify-playlist-maker/` doesn't exist. That keeps iteration cheap.
 
-This intentionally isn't done in v0.1 — single-source for the skill keeps the repo simple while we shake out real usage.
+For end users, the plugin lives at `${CLAUDE_PLUGIN_ROOT}` after `/plugin install` and reads/writes from `~/.spotify-playlist-maker/`. Same code, different config dir.
+
+### MCP wrapper (v0.3+)
+
+A Claude Desktop MCP server is planned as a thin wrapper around `playlist_maker/` — exposes `create_playlist_from_artists` and `create_concert_playlist` tools. Same package powers both surfaces. Deferred until the plugin sees real usage.

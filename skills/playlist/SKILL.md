@@ -1,8 +1,8 @@
 ---
 description: Build a Spotify playlist from any description of what you want — a festival lineup image, a pasted artist list, a concert you're going to, a tour name, a single artist, a vibe. Interprets messy natural language, researches missing info from the web when needed, and creates the playlist in the user's Spotify account.
 disable-model-invocation: true
-allowed-tools: Bash(.venv/bin/python *), Bash(python3 *), Bash(test *), Bash(ls *), Bash(mkdir *), Bash(grep *), Read, Write, Edit, Glob, WebFetch, WebSearch
-argument-hint: "describe what you want — \"seeing Phoebe Bridgers Friday\" / \"Coachella 2027 lineup\" / [attached poster] / lineups/foo.txt"
+allowed-tools: Bash(python3 *), Bash(test *), Bash(ls *), Bash(mkdir *), Bash(grep *), Bash(pip3 *), Read, Write, Edit, Glob, WebFetch, WebSearch
+argument-hint: "describe what you want — \"seeing Phoebe Bridgers Friday\" / \"Coachella 2027 lineup\" / [attached poster] / path/to/lineup.txt"
 ---
 
 # /playlist — Build a Spotify playlist from any description
@@ -11,12 +11,12 @@ You are an **orchestrator**. The user describes what playlist they want in messy
 
 ## The primitives you have
 
-The Python CLI (`spotify_playlist.py`) gives you two execution modes:
+The Python CLI (`${CLAUDE_PLUGIN_ROOT}/spotify_playlist.py`) gives you two execution modes:
 
 | Mode | Flag | What it does |
 |---|---|---|
 | Top-tracks | `--artists <file>` | Playlist of top N tracks for each artist in a text file. The list-of-artists case. |
-| Concert | `--setlist "<artist>"` | Playlist from an artist's most recent live setlists. Optional `--tour "<name>"` or `--year <yyyy>` filters. The going-to-a-show case. |
+| Concert | `--setlist "<artist>"` | Playlist from an artist's most recent live setlists. Optional `--tour "<name>"` or `--year <yyyy>` filters. Pass multiple times for openers/co-headliners. |
 
 Common flags either mode accepts: `--name`, `--description`, `--public`, `--replace` (wipe before adding), `--dry-run`, `--top N` (top-tracks), `--shows N` (concert, default 10), `--fast` (skip album-walk fallback for Spotify quota).
 
@@ -26,18 +26,36 @@ Everything else is YOU figuring out which primitive to call with what arguments 
 
 ## Step 0 — Environment check (always first, just once per session)
 
+Config lives in `~/.spotify-playlist-maker/` (the plugin reads `.env` and writes
+caches there; lineup files default there too). The script lives in
+`${CLAUDE_PLUGIN_ROOT}/spotify_playlist.py`.
+
 ```bash
-test -f .env && test -f spotify_playlist.py && test -d lineups
+test -f ~/.spotify-playlist-maker/.env && \
+    mkdir -p ~/.spotify-playlist-maker/lineups
 ```
 
-Pick the Python interpreter: prefer `.venv/bin/python` if it exists, fall back to `python3`. Use that for every CLI call below.
+If `.env` doesn't exist, this is **first-run setup** — walk the user through it:
 
-Grep `.env` for what's configured:
-- `SPOTIPY_*` — required (playlist write). If missing, point to README §1.
-- `LASTFM_API_KEY` — strongly recommended for top-tracks mode. Without it, Spotify's ~150 calls/day quota becomes the bottleneck. If absent and the user wants a large list, mention this and offer to wait while they set one up (https://www.last.fm/api/account/create, instant).
-- `SETLISTFM_API_KEY` — required only for concert mode. If absent and they want concert mode, point to https://www.setlist.fm/settings/api (instant).
+1. Make sure Python deps are installed: `pip3 install --user spotipy python-dotenv requests` (skip if `python3 -c 'import spotipy, dotenv, requests'` already works).
+2. They need a Spotify dev app — point them at https://developer.spotify.com/dashboard. They create an app, set redirect URI to `http://127.0.0.1:8888/callback`, add themselves to User Management, copy Client ID + Client Secret.
+3. Strongly recommend a free Last.fm API key: https://www.last.fm/api/account/create (instant, no approval). Without it, Spotify's ~150 calls/day quota bottlenecks everything.
+4. For concert mode they also need a Setlist.fm key: https://www.setlist.fm/settings/api (instant).
+5. Write `~/.spotify-playlist-maker/.env` with whatever they have:
+   ```
+   SPOTIPY_CLIENT_ID=...
+   SPOTIPY_CLIENT_SECRET=...
+   SPOTIPY_REDIRECT_URI=http://127.0.0.1:8888/callback
+   LASTFM_API_KEY=...        # optional but strongly recommended
+   SETLISTFM_API_KEY=...     # optional, only for concert mode
+   ```
 
-If `.venv` is missing: `python3 -m venv .venv && .venv/bin/pip install spotipy python-dotenv requests`.
+If `.env` exists, grep it to check what's configured:
+- `SPOTIPY_*` — required for playlist write. If missing, do the setup flow above.
+- `LASTFM_API_KEY` — strongly recommended. If absent and the user wants a large list, offer to wait while they set one up.
+- `SETLISTFM_API_KEY` — required only for concert mode. If absent and they want concert mode, prompt for it.
+
+Use `python3` for every CLI call below. The script is at `${CLAUDE_PLUGIN_ROOT}/spotify_playlist.py`.
 
 ---
 
@@ -49,7 +67,7 @@ The user's input might be any of these. Pick the matching pattern:
 |---|---|---|
 | Attached image (poster, lineup graphic, screenshot) | Playlist of those artists | Top-tracks |
 | Pasted multi-line list of names | Same | Top-tracks |
-| Path to an existing `lineups/*.txt` | Same, skip extraction | Top-tracks |
+| Path to an existing `.txt` lineup file | Same, skip extraction | Top-tracks |
 | "I'm seeing X" / "going to X" / "for the X show" | Concert mode | `--setlist "X"` |
 | "X's [tour-name] tour" | Concert mode with tour filter | `--setlist + --tour` |
 | "X 2019" / "X at Lollapalooza last year" | Concert mode with year filter | `--setlist + --year` |
@@ -70,7 +88,7 @@ When the user names a festival/event but doesn't paste the artist list:
 
 1. `WebSearch` for `"<festival> <year> lineup"` or `"<festival> <year> all artists"`. Look for the official site or a comprehensive list (Wikipedia is often good).
 2. `WebFetch` the most-promising URL and extract the FULL artist list — headliners AND smaller acts. Side stages count.
-3. Tell the user the count and a few sample names: "I found 124 artists for ACL 2026 from their site (headliners include Charli XCX, RÜFÜS DU SOL, Twenty One Pilots …). Saving as `lineups/acl_2026.txt`."
+3. Tell the user the count and a few sample names: "I found 124 artists for ACL 2026 from their site (headliners include Charli XCX, RÜFÜS DU SOL, Twenty One Pilots …). Saving as `~/.spotify-playlist-maker/lineups/acl_2026.txt`."
 4. Confirm before writing if the count is dramatically off from expectation.
 
 ### Researching a tour name
@@ -92,8 +110,10 @@ Three searches max for one request, unless the user explicitly asks for thorough
 
 ```
 1. WebSearch + WebFetch to extract full lineup
-2. Slugify name → write to lineups/<slug>.txt
-3. <python> spotify_playlist.py --artists lineups/<slug>.txt --name "<derived>" --dry-run
+2. Slugify name → write to ~/.spotify-playlist-maker/lineups/<slug>.txt
+3. python3 ${CLAUDE_PLUGIN_ROOT}/spotify_playlist.py \
+       --artists ~/.spotify-playlist-maker/lineups/<slug>.txt \
+       --name "<derived>" --dry-run
 4. Review loop (see below)
 5. Confirm → real run
 ```
@@ -110,7 +130,7 @@ A "concert" is rarely just one artist — there are usually openers / supporting
    - Or check Setlist.fm for other setlists at the same venue+date
 2. (Optional) WebSearch for tour name if user said "current tour" etc.
 3. Pass every artist via repeated --setlist:
-   <python> spotify_playlist.py \
+   python3 ${CLAUDE_PLUGIN_ROOT}/spotify_playlist.py \
        --setlist "Headliner" --setlist "Opener 1" --setlist "Opener 2" \
        [--tour ...] [--year ...] [--shows N] --dry-run
 4. Surface per-artist track count + total + any covers worth flagging
@@ -132,7 +152,8 @@ For single-artist live (no openers), same pattern with just one `--setlist`.
 
 ```
 1. Skip extraction.
-2. <python> spotify_playlist.py --artists <path> --name "<derived>" --dry-run
+2. python3 ${CLAUDE_PLUGIN_ROOT}/spotify_playlist.py \
+       --artists <path> --name "<derived>" --dry-run
 3. Continue as Pattern A from step 4.
 ```
 
@@ -162,14 +183,19 @@ Concert mode usually doesn't need this — Setlist.fm's artist match is explicit
 
 ## Existing-playlist check (before any real write)
 
-```python
+Run via:
+```bash
+python3 -c "$(cat <<'PY'
+import sys
+sys.path.insert(0, "${CLAUDE_PLUGIN_ROOT}")
 import spotipy
 from dotenv import load_dotenv
 from spotipy.oauth2 import SpotifyOAuth
-load_dotenv(".env")
+from playlist_maker.config import env_path, oauth_cache_path
+load_dotenv(env_path())
 sp = spotipy.Spotify(auth_manager=SpotifyOAuth(
     scope="playlist-modify-public playlist-modify-private playlist-read-private",
-    cache_path=".spotify_cache", open_browser=False,
+    cache_path=str(oauth_cache_path()), open_browser=False,
 ))
 uid = sp.current_user()["id"]
 name = "<playlist>"
@@ -189,6 +215,8 @@ if existing:
     print(f"EXISTS:{existing['id']}:{total}")
 else:
     print("NEW")
+PY
+)"
 ```
 
 If `EXISTS:...:N`, ask: "A playlist named '<name>' already exists with N tracks. **Append** new tracks, or **wipe and rebuild**?" Pass `--replace` for wipe.

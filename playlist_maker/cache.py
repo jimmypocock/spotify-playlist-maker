@@ -19,8 +19,6 @@ from pathlib import Path
 
 from .models import ArtistCandidate, ArtistEntry, ResolveResult
 
-RESOLUTION_CACHE_PATH = ".resolution_cache.json"
-
 log = logging.getLogger("playlist")
 
 

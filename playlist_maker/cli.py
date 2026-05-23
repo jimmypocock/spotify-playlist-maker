@@ -12,7 +12,6 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from .cache import (
-    RESOLUTION_CACHE_PATH,
     cache_key,
     cache_record,
     hydrate_from_cache,
@@ -20,6 +19,7 @@ from .cache import (
     save_resolution_cache,
 )
 from .clients.spotify import RATE_LIMIT_SLEEP, get_client, get_playlist_url
+from .config import env_path, resolution_cache_path
 from .confidence import print_review_block, score_confidence
 from .models import ArtistEntry, ResolveResult
 from .services.playlist import get_or_create_playlist, write_playlist
@@ -186,7 +186,7 @@ def _print_summary(results: list[ResolveResult], artists_file: Path) -> None:
 
 def main() -> int:
     _configure_logging()
-    load_dotenv(".env")
+    load_dotenv(env_path())
 
     args = _parse_args()
 
@@ -236,7 +236,7 @@ def main() -> int:
         time.sleep(RATE_LIMIT_SLEEP)
         # Phase 1: resolve every artist and collect top tracks
         results = _resolve_all(
-            sp, entries, Path(RESOLUTION_CACHE_PATH),
+            sp, entries, resolution_cache_path(),
             args.top, args.market, fast=args.fast,
         )
         _print_summary(results, args.artists)

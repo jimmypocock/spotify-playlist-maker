@@ -24,10 +24,11 @@ from typing import Optional
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 
+from ..config import oauth_cache_path
+
 # Public scopes — playlist-read-private is needed for current_user_playlists,
 # the rest for creating and modifying playlists.
 SCOPES = "playlist-modify-public playlist-modify-private playlist-read-private"
-OAUTH_CACHE_PATH = ".spotify_cache"
 
 SPOTIFY_ADD_BATCH = 100  # max tracks per add-to-playlist call
 SEARCH_LIMIT = 10        # Spotify search max page size as of Feb 2026
@@ -49,7 +50,7 @@ def get_client() -> spotipy.Spotify:
 
     auth = SpotifyOAuth(
         scope=SCOPES,
-        cache_path=OAUTH_CACHE_PATH,
+        cache_path=str(oauth_cache_path()),
         open_browser=True,
     )
     return spotipy.Spotify(auth_manager=auth, retries=3)
