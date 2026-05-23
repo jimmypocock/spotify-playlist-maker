@@ -192,9 +192,18 @@ When extending: keep all Spotify API logic in the Python CLI (so it stays script
 
 ### Dev workflow vs. plugin-install workflow
 
-The CLI is **dual-mode** on purpose. Inside this repo, `python spotify_playlist.py --artists lineups/foo.txt …` still works — `config.py` falls back to CWD when `~/.spotify-playlist-maker/` doesn't exist. That keeps iteration cheap.
+The CLI is **dual-mode** on purpose. Inside this repo, `.venv/bin/python spotify_playlist.py --artists lineups/foo.txt …` still works — `config.py` falls back to CWD when `~/.spotify-playlist-maker/` doesn't exist. That keeps iteration cheap (no uv install required for development).
 
-For end users, the plugin lives at `${CLAUDE_PLUGIN_ROOT}` after `/plugin install` and reads/writes from `~/.spotify-playlist-maker/`. Same code, different config dir.
+For end users, the plugin lives at `${CLAUDE_PLUGIN_ROOT}` after `/plugin install`. Invocations go through `uv run` — uv reads the PEP 723 inline metadata in `spotify_playlist.py` (declares spotipy/dotenv/requests), installs them to a cached isolated env on first run, reuses cache after. No `pip install` step for users; uv handles everything. Config (`.env`, caches, lineups) lives under `~/.spotify-playlist-maker/`.
+
+### Why PEP 723 + uv (not pipx, not auto-pip-install)
+
+This was the 2026-professional answer per a research pass:
+- **uv is the standard** — 10-100x faster than pipx, single binary, includes Python version management. What most modern Python tooling (Astral's stack, anyway) recommends.
+- **PEP 723 puts dep declarations in the script itself** — no separate `requirements.txt` to drift out of sync, no `setup.py` overhead, version pins live with the code.
+- **Auto-installing pip inside the script** (the `try: import X; except: subprocess.check_call(...)` pattern) is officially a tolerated antipattern — flagged by PyPA, fails under PEP 668 (externally-managed environments common on recent macOS/Linux Python), and pollutes the user's environment.
+
+The one tradeoff: users need `uv` installed (one-line install: `curl -LsSf https://astral.sh/uv/install.sh | sh` or `brew install uv`). Step 0 of the skill checks for it and walks the user through install if missing.
 
 ### MCP wrapper (v0.3+)
 

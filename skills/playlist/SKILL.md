@@ -1,7 +1,7 @@
 ---
 description: Build a Spotify playlist from any description of what you want — a festival lineup image, a pasted artist list, a concert you're going to, a tour name, a single artist, a vibe. Interprets messy natural language, researches missing info from the web when needed, and creates the playlist in the user's Spotify account.
 disable-model-invocation: true
-allowed-tools: Bash(python3 *), Bash(test *), Bash(ls *), Bash(mkdir *), Bash(grep *), Bash(pip3 *), Read, Write, Edit, Glob, WebFetch, WebSearch
+allowed-tools: Bash(uv *), Bash(command *), Bash(test *), Bash(ls *), Bash(mkdir *), Bash(grep *), Read, Write, Edit, Glob, WebFetch, WebSearch
 argument-hint: "describe what you want — \"seeing Phoebe Bridgers Friday\" / \"Coachella 2027 lineup\" / [attached poster] / path/to/lineup.txt"
 ---
 
@@ -26,22 +26,27 @@ Everything else is YOU figuring out which primitive to call with what arguments 
 
 ## Step 0 — Environment check (always first, just once per session)
 
-Config lives in `~/.spotify-playlist-maker/` (the plugin reads `.env` and writes
-caches there; lineup files default there too). The script lives in
-`${CLAUDE_PLUGIN_ROOT}/spotify_playlist.py`.
+This plugin uses `uv` to handle Python deps automatically (PEP 723 inline metadata). Config lives in `~/.spotify-playlist-maker/` (`.env`, caches, default lineups dir). The script lives at `${CLAUDE_PLUGIN_ROOT}/spotify_playlist.py`.
 
 ```bash
-test -f ~/.spotify-playlist-maker/.env && \
+command -v uv >/dev/null && \
+    test -f ~/.spotify-playlist-maker/.env && \
     mkdir -p ~/.spotify-playlist-maker/lineups
 ```
 
-If `.env` doesn't exist, this is **first-run setup** — walk the user through it:
+**If `uv` is missing**, instruct the user to install it (one-time, ~5 seconds):
+- macOS / Linux: `curl -LsSf https://astral.sh/uv/install.sh | sh`
+- Or via homebrew: `brew install uv`
+- Or via mise/asdf/winget if they prefer their existing tool
 
-1. Make sure Python deps are installed: `pip3 install --user spotipy python-dotenv requests` (skip if `python3 -c 'import spotipy, dotenv, requests'` already works).
-2. They need a Spotify dev app — point them at https://developer.spotify.com/dashboard. They create an app, set redirect URI to `http://127.0.0.1:8888/callback`, add themselves to User Management, copy Client ID + Client Secret.
-3. Strongly recommend a free Last.fm API key: https://www.last.fm/api/account/create (instant, no approval). Without it, Spotify's ~150 calls/day quota bottlenecks everything.
-4. For concert mode they also need a Setlist.fm key: https://www.setlist.fm/settings/api (instant).
-5. Write `~/.spotify-playlist-maker/.env` with whatever they have:
+Once installed, every CLI call below works automatically — uv reads the PEP 723 header in `spotify_playlist.py`, installs spotipy/dotenv/requests into an isolated cached env on first run, reuses the cache after.
+
+**If `.env` doesn't exist**, this is **first-run setup** — walk the user through it:
+
+1. They need a Spotify dev app — point them at https://developer.spotify.com/dashboard. They create an app, set redirect URI to `http://127.0.0.1:8888/callback`, add themselves to User Management, copy Client ID + Client Secret.
+2. Strongly recommend a free Last.fm API key: https://www.last.fm/api/account/create (instant, no approval). Without it, Spotify's ~150 calls/day quota bottlenecks everything.
+3. For concert mode they also need a Setlist.fm key: https://www.setlist.fm/settings/api (instant).
+4. Write `~/.spotify-playlist-maker/.env` with whatever they have:
    ```
    SPOTIPY_CLIENT_ID=...
    SPOTIPY_CLIENT_SECRET=...
@@ -50,12 +55,12 @@ If `.env` doesn't exist, this is **first-run setup** — walk the user through i
    SETLISTFM_API_KEY=...     # optional, only for concert mode
    ```
 
-If `.env` exists, grep it to check what's configured:
+**If `.env` exists**, grep it to check what's configured:
 - `SPOTIPY_*` — required for playlist write. If missing, do the setup flow above.
 - `LASTFM_API_KEY` — strongly recommended. If absent and the user wants a large list, offer to wait while they set one up.
 - `SETLISTFM_API_KEY` — required only for concert mode. If absent and they want concert mode, prompt for it.
 
-Use `python3` for every CLI call below. The script is at `${CLAUDE_PLUGIN_ROOT}/spotify_playlist.py`.
+Use `uv run` for every CLI call below.
 
 ---
 
@@ -111,7 +116,7 @@ Three searches max for one request, unless the user explicitly asks for thorough
 ```
 1. WebSearch + WebFetch to extract full lineup
 2. Slugify name → write to ~/.spotify-playlist-maker/lineups/<slug>.txt
-3. python3 ${CLAUDE_PLUGIN_ROOT}/spotify_playlist.py \
+3. uv run ${CLAUDE_PLUGIN_ROOT}/spotify_playlist.py \
        --artists ~/.spotify-playlist-maker/lineups/<slug>.txt \
        --name "<derived>" --dry-run
 4. Review loop (see below)
@@ -130,7 +135,7 @@ A "concert" is rarely just one artist — there are usually openers / supporting
    - Or check Setlist.fm for other setlists at the same venue+date
 2. (Optional) WebSearch for tour name if user said "current tour" etc.
 3. Pass every artist via repeated --setlist:
-   python3 ${CLAUDE_PLUGIN_ROOT}/spotify_playlist.py \
+   uv run ${CLAUDE_PLUGIN_ROOT}/spotify_playlist.py \
        --setlist "Headliner" --setlist "Opener 1" --setlist "Opener 2" \
        [--tour ...] [--year ...] [--shows N] --dry-run
 4. Surface per-artist track count + total + any covers worth flagging
@@ -152,7 +157,7 @@ For single-artist live (no openers), same pattern with just one `--setlist`.
 
 ```
 1. Skip extraction.
-2. python3 ${CLAUDE_PLUGIN_ROOT}/spotify_playlist.py \
+2. uv run ${CLAUDE_PLUGIN_ROOT}/spotify_playlist.py \
        --artists <path> --name "<derived>" --dry-run
 3. Continue as Pattern A from step 4.
 ```
@@ -183,9 +188,10 @@ Concert mode usually doesn't need this — Setlist.fm's artist match is explicit
 
 ## Existing-playlist check (before any real write)
 
-Run via:
+Run via `uv run --with` — same dep stack as the script, no install needed:
+
 ```bash
-python3 -c "$(cat <<'PY'
+uv run --with spotipy --with python-dotenv python -c "$(cat <<'PY'
 import sys
 sys.path.insert(0, "${CLAUDE_PLUGIN_ROOT}")
 import spotipy
